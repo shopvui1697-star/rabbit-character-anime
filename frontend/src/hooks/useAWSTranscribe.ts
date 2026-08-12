@@ -267,7 +267,7 @@ export function useAWSTranscribe({
       }
 
       // Ensure Japanese language code is used
-      const languageCode = config.languageCode || "ja-JP";
+      const languageCode = config.languageCode || "en-US";
       
       log.debug("📋 AWS Config:", {
         region,

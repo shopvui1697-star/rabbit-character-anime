@@ -33,14 +33,29 @@ const HIRAGANA_TO_NUMBER: Record<string, number> = {
   'ろく': 6, 'なな': 7, 'しち': 7, 'はち': 8, 'きゅう': 9, 'く': 9,
 };
 
+const ENGLISH_ORDINAL_TO_NUMBER: Record<string, number> = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+  sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+};
+
 /**
- * Selection patterns for extracting numbers from Japanese text
+ * Selection patterns for extracting numbers from voice/text input
  */
 const SELECTION_PATTERNS: Array<{
   pattern: RegExp;
   extract: (match: RegExpMatchArray) => number | null;
 }> = [
-  // "N番" - Arabic numeral + 番 (supports multi-digit: 1番, 10番, 12番)
+  // English: "number 2", "#2", "item 3"
+  {
+    pattern: /(?:number|#|item)\s*([1-9]\d*)/i,
+    extract: (m) => parseInt(m[1]),
+  },
+  // English ordinals: "second", "third"
+  {
+    pattern: /\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/i,
+    extract: (m) => ENGLISH_ORDINAL_TO_NUMBER[m[1].toLowerCase()] ?? null,
+  },
+  // Japanese: "N番" - Arabic numeral + 番 (supports multi-digit: 1番, 10番, 12番)
   {
     pattern: /([1-9]\d*)番/,
     extract: (m) => parseInt(m[1]),
@@ -79,6 +94,20 @@ const RELATIVE_PATTERNS: Array<{
   pattern: RegExp;
   resolve: (totalItems: number, currentIndex: number | null) => number | null;
 }> = [
+  // English relative selection
+  {
+    pattern: /\b(first|top)\b/i,
+    resolve: (total) => total > 0 ? 0 : null,
+  },
+  {
+    pattern: /\b(last|bottom)\b/i,
+    resolve: (total) => total > 0 ? total - 1 : null,
+  },
+  {
+    pattern: /\b(middle|center)\b/i,
+    resolve: (total) => total >= 3 ? Math.floor(total / 2) : null,
+  },
+  // Japanese relative selection
   // "最初" "最初の" - first item
   {
     pattern: /最初/,
@@ -150,6 +179,7 @@ export function extractRelativeSelection(
  */
 export function isSelectionCommand(text: string): boolean {
   return extractSelectionNumber(text) !== null ||
+    /\b(first|last|middle|center|top|bottom)\b/i.test(text) ||
     /最初|最後|真ん中|上の|下の/.test(text);
 }
 

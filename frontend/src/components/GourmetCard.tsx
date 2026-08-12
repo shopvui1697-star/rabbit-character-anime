@@ -96,7 +96,7 @@ export const GourmetCard = memo(
           {address && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>📍</span> 住所:
+                <span className={styles.detailIcon}>📍</span> Address:
               </span>
               <span className={styles.value}>{address}</span>
             </div>
@@ -106,7 +106,7 @@ export const GourmetCard = memo(
           {access && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>🚃</span> アクセス:
+                <span className={styles.detailIcon}>🚃</span> Access:
               </span>
               <span className={styles.value}>{access}</span>
             </div>
@@ -116,7 +116,7 @@ export const GourmetCard = memo(
           {openHours && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>🕐</span> 営業時間:
+                <span className={styles.detailIcon}>🕐</span> Hours:
               </span>
               <span className={styles.value}>{openHours}</span>
             </div>
@@ -126,7 +126,7 @@ export const GourmetCard = memo(
           {closeDays && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>📅</span> 定休日:
+                <span className={styles.detailIcon}>📅</span> Closed:
               </span>
               <span className={styles.value}>{closeDays}</span>
             </div>
@@ -136,9 +136,9 @@ export const GourmetCard = memo(
           {capacity && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>👥</span> 収容人数:
+                <span className={styles.detailIcon}>👥</span> Capacity:
               </span>
-              <span className={styles.value}>{capacity}名</span>
+              <span className={styles.value}>{capacity}</span>
             </div>
           )}
           
@@ -146,7 +146,7 @@ export const GourmetCard = memo(
           {parking && (
             <div className={styles.detail}>
               <span className={styles.label}>
-                <span className={styles.detailIcon}>🅿️</span> 駐車場:
+                <span className={styles.detailIcon}>🅿️</span> Parking:
               </span>
               <span className={styles.value}>{parking}</span>
             </div>
@@ -156,7 +156,7 @@ export const GourmetCard = memo(
           {urlsPc && (
             <div className={styles.link}>
               <a href={urlsPc} target="_blank" rel="noopener noreferrer">
-                <span className={styles.linkIcon}>🔗</span> 詳細を見る
+                <span className={styles.linkIcon}>🔗</span> View details
               </a>
             </div>
           )}
@@ -166,7 +166,7 @@ export const GourmetCard = memo(
             className={`${styles.saveButton} ${isSaved ? styles.saved : ""}`}
             onClick={(e) => { e.stopPropagation(); onSave(); }}
             disabled={isSaved}
-            title={isSaved ? "保存済み" : "アーカイブに保存"}
+            title={isSaved ? "Saved" : "Save to archive"}
           >
             {isSaved ? "✓" : "📚"}
           </button>
@@ -174,7 +174,7 @@ export const GourmetCard = memo(
             <button
               className={styles.detailButton}
               onClick={(e) => { e.stopPropagation(); onDetail(); }}
-              title="詳細を見る"
+              title="View details"
             >
               📋
             </button>
@@ -187,7 +187,7 @@ export const GourmetCard = memo(
         <div className={styles.friendsSection}>
           <p className={styles.friendsTitle}>
             <span className={styles.friendsIcon}>👥</span>
-            このお店を保存している友達:
+            Friends who saved this place:
           </p>
           <div className={styles.friendButtons}>
             {friendsMatched.map((friend) => (
@@ -195,10 +195,10 @@ export const GourmetCard = memo(
                 key={friend.id}
                 className={styles.appointmentButton}
                 onClick={() => handleAppointment(friend)}
-                title={`${friend.name}さんと予約する`}
+                title={`Book with ${friend.name}`}
               >
                 <span className={styles.appointmentIcon}>📅</span>
-                {friend.name}さんと予約
+                Book with {friend.name}
               </button>
             ))}
           </div>

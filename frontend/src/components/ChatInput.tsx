@@ -105,12 +105,12 @@ export function ChatInput({
   const isDisabled = disabled || (status !== "idle" && status !== "speaking" && !isListening);
   
   const placeholder = isListening
-    ? interimTranscript || "聞いています..."
+    ? interimTranscript || "Listening..."
     : status === "thinking"
-    ? "考え中..."
+    ? "Thinking..."
     : status === "speaking"
-    ? "話しています... (話しかけると中断できます)"
-    : "メッセージを入力...";
+    ? "Speaking... (talk to interrupt)"
+    : "Type a message...";
 
   return (
     <div className={styles.container}>
@@ -131,8 +131,8 @@ export function ChatInput({
         className={`${styles.micButton} ${isListening ? styles.micRecording : ""} ${voiceDetected ? styles.micVoiceDetected : ""}`}
         onClick={handleMicClick}
         disabled={disabled || !isMicSupported}
-        aria-label={isListening ? "録音停止" : "録音開始"}
-        title={isListening ? "クリックして停止 " : "クリックして話す"}
+        aria-label={isListening ? "Stop recording" : "Start recording"}
+        title={isListening ? "Click to stop" : "Click to speak"}
       >
         <div className={styles.micIconWrapper}>
           {isListening && (
@@ -159,7 +159,7 @@ export function ChatInput({
           className={styles.sendButton}
           onClick={handleSend}
           disabled={isDisabled || !input.trim()}
-          aria-label="送信"
+          aria-label="Send"
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"

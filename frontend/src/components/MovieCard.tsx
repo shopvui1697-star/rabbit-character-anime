@@ -80,7 +80,7 @@ export const MovieCard = memo(
             {/* Movie metadata */}
             {isMovie && releaseYear && (
               <span className={styles.year}>
-                <span className={styles.icon}>📅</span> {releaseYear}年
+                <span className={styles.icon}>📅</span> {releaseYear}
               </span>
             )}
             {isMovie && rating !== undefined && (
@@ -105,20 +105,20 @@ export const MovieCard = memo(
           {/* Gourmet additional info */}
           {isGourmet && access && (
             <div className={styles.detail}>
-              <span className={styles.label}>アクセス:</span>
+              <span className={styles.label}>Access:</span>
               <span className={styles.value}>{access}</span>
             </div>
           )}
           {isGourmet && openHours && (
             <div className={styles.detail}>
-              <span className={styles.label}>営業時間:</span>
+              <span className={styles.label}>Hours:</span>
               <span className={styles.value}>{openHours}</span>
             </div>
           )}
           {isGourmet && urlsPc && (
             <div className={styles.link}>
               <a href={urlsPc} target="_blank" rel="noopener noreferrer">
-                詳細を見る →
+                View details →
               </a>
             </div>
           )}
@@ -128,7 +128,7 @@ export const MovieCard = memo(
             className={`${styles.saveButton} ${isSaved ? styles.saved : ""}`}
             onClick={(e) => { e.stopPropagation(); onSave(); }}
             disabled={isSaved}
-            title={isSaved ? "保存済み" : "アーカイブに保存"}
+            title={isSaved ? "Saved" : "Save to archive"}
           >
             {isSaved ? "✓" : "📚"}
           </button>
@@ -136,7 +136,7 @@ export const MovieCard = memo(
             <button
               className={styles.detailButton}
               onClick={(e) => { e.stopPropagation(); onDetail(); }}
-              title="詳細を見る"
+              title="View details"
             >
               📋
             </button>
@@ -149,7 +149,7 @@ export const MovieCard = memo(
         <div className={styles.friendsSection}>
           <p className={styles.friendsTitle}>
             <span className={styles.friendsIcon}>👥</span>
-            この作品を保存している友達:
+            Friends who saved this title:
           </p>
           <div className={styles.friendButtons}>
             {friendsMatched.map((friend) => (
@@ -157,10 +157,10 @@ export const MovieCard = memo(
                 key={friend.id}
                 className={styles.appointmentButton}
                 onClick={() => handleAppointment(friend)}
-                title={`${friend.name}さんと予約する`}
+                title={`Book with ${friend.name}`}
               >
                 <span className={styles.appointmentIcon}>📅</span>
-                {friend.name}さんと予約
+                Book with {friend.name}
               </button>
             ))}
           </div>

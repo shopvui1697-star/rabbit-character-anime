@@ -12,7 +12,7 @@
 
 // Template functions for context-aware waiting phrases
 export interface WaitingContext {
-  query?: string;      // User's search query (e.g., "アクション映画")
+  query?: string;      // User's search query (e.g., "action movies")
   genre?: string;      // Detected genre
   year?: number;       // Detected year
 }
@@ -21,40 +21,39 @@ export interface WaitingContext {
  * Generate a context-aware waiting phrase for database search
  * 
  * @param context - Information about the search being performed
- * @returns Japanese waiting phrase that confirms and acknowledges the search
+ * @returns English waiting phrase that confirms and acknowledges the search
  */
 export function generateLongWaitingPhrase(context: WaitingContext): string {
   const templates = [
-    // General search phrases
-    "少々お待ちください、今すぐ探してみますね。",
-    "了解です、ちょっと調べてみますね。",
-    "わかりました、今確認しています。",
-    "はい、探してみますね、少々お待ちください。",
+    "One moment, I'll look that up for you.",
+    "Got it, let me check on that.",
+    "Okay, I'm checking now.",
+    "Sure, I'll search for that. Just a sec.",
     
     // With query confirmation
     ...(context.query ? [
-      `${context.query}ですね、今探していますので少々お待ちください。`,
-      `了解です、${context.query}を調べてみますね。`,
-      `${context.query}についてお調べしますね。`,
-      `なるほど、${context.query}ですね。今確認しています。`,
+      `${context.query}, got it. I'm searching now, one moment.`,
+      `Okay, I'll look up ${context.query} for you.`,
+      `Looking into ${context.query} for you.`,
+      `Ah, ${context.query}. Checking that now.`,
     ] : []),
     
     // With genre confirmation
     ...(context.genre ? [
-      `${context.genre}の作品ですね、今探していますので少々お待ちください。`,
-      `${context.genre}ですね、データベースを確認しています。`,
+      `${context.genre} titles, got it. Searching now, one moment.`,
+      `${context.genre}, right. Checking the database.`,
     ] : []),
     
     // With year confirmation
     ...(context.year ? [
-      `${context.year}年の作品ですね、今探していますので少々お待ちください。`,
-      `${context.year}年ですね、調べてみますね。`,
+      `Titles from ${context.year}, got it. Searching now.`,
+      `${context.year}, okay. Let me look that up.`,
     ] : []),
     
     // Combined confirmations
     ...(context.genre && context.year ? [
-      `${context.year}年の${context.genre}作品ですね、今確認しています。`,
-      `了解です、${context.year}年の${context.genre}を探してみますね。`,
+      `${context.genre} from ${context.year}, checking now.`,
+      `Got it, looking for ${context.year} ${context.genre} titles.`,
     ] : []),
   ];
   
@@ -66,12 +65,12 @@ export function generateLongWaitingPhrase(context: WaitingContext): string {
  * Simplified waiting phrases without context (fallback)
  */
 export const SIMPLE_LONG_WAITING_PHRASES = [
-  "少々お待ちください、今すぐ探してみますね。",
-  "了解です、ちょっと調べてみますね。",
-  "わかりました、今確認しています。",
-  "はい、探してみますね、少々お待ちください。",
-  "データベースを確認していますので、少々お待ちください。",
-  "今すぐお調べしますね。",
+  "One moment, I'll look that up for you.",
+  "Got it, let me check on that.",
+  "Okay, I'm checking now.",
+  "Sure, I'll search for that. Just a sec.",
+  "Checking the database, one moment please.",
+  "I'll look that up right away.",
 ] as const;
 
 /**

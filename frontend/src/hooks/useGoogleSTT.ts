@@ -15,6 +15,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { AudioCaptureManager } from "@/utils/audioUtils";
 import { createLogger } from "@/utils/logger";
+import { isWebSpeechSupported, useWebSpeechFallback } from "./useWebSpeechFallback";
 
 const log = createLogger("GoogleSTT");
 
@@ -80,6 +81,12 @@ export interface UseGoogleSTTReturn {
 /**
  * Helper: Convert Uint8Array to base64 string
  */
+function isBackendSttSetupError(message: string): boolean {
+  return /no stt credentials|no credentials for provider|invalid api key|gsk_|organization id|groq stt authentication|add .* api key/i.test(
+    message
+  );
+}
+
 function uint8ArrayToBase64(data: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < data.length; i++) {
@@ -104,11 +111,15 @@ export function useGoogleSTT({
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [error, setError] = useState<Error | null>(null);
+  const [useWebSpeech, setUseWebSpeech] = useState(false);
 
   const audioCapture = useRef<AudioCaptureManager | null>(null);
   const inactivityTimer = useRef<NodeJS.Timeout | null>(null);
   const instanceId = useRef<string>(`google-stt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`);
-  const isListeningRef = useRef(false); // Ref to track listening state in callbacks
+  const isListeningRef = useRef(false);
+  const usingWebSpeechRef = useRef(false);
+  const startWebSpeechRef = useRef<(() => void) | null>(null);
+  const stopWebSpeechRef = useRef<(() => void) | null>(null);
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
   const onStartRef = useRef(onStart);
@@ -125,6 +136,47 @@ export function useGoogleSTT({
     onStartRef.current = onStart;
     onStopRef.current = onStop;
   }, [onTranscript, onError, onStart, onStop]);
+
+  const webSpeech = useWebSpeechFallback({
+    languageCode: config.languageCode || "en-US",
+    onTranscript,
+    onError,
+    onStart: () => {
+      usingWebSpeechRef.current = true;
+      isListeningRef.current = true;
+      setUseWebSpeech(true);
+      setIsListening(true);
+      onStart?.();
+    },
+    onStop: () => {
+      usingWebSpeechRef.current = false;
+      isListeningRef.current = false;
+      setUseWebSpeech(false);
+      setIsListening(false);
+      onStop?.();
+    },
+  });
+
+  useEffect(() => {
+    startWebSpeechRef.current = webSpeech.startListening;
+    stopWebSpeechRef.current = webSpeech.stopListening;
+  }, [webSpeech.startListening, webSpeech.stopListening]);
+
+  const fallbackToWebSpeech = useCallback((reason: string) => {
+    if (!isWebSpeechSupported()) {
+      log.error("Backend STT unavailable and Web Speech API is not supported");
+      return false;
+    }
+
+    log.warn(`Backend STT unavailable (${reason}) — falling back to Web Speech API`);
+    usingWebSpeechRef.current = true;
+    setUseWebSpeech(true);
+    setError(null);
+    setTranscript("");
+    setInterimTranscript("");
+    startWebSpeechRef.current?.();
+    return true;
+  }, []);
 
   // ─── Clear stability timer ───
   const clearStabilityTimer = useCallback(() => {
@@ -208,6 +260,14 @@ export function useGoogleSTT({
           case "stt_error": {
             const errMsg = message.error || "Unknown STT error";
             log.error("❌ Backend STT error:", errMsg);
+
+            if (isListeningRef.current && !usingWebSpeechRef.current && isBackendSttSetupError(errMsg)) {
+              stopListeningInternal(false);
+              if (fallbackToWebSpeech(errMsg)) {
+                break;
+              }
+            }
+
             const err = new Error(errMsg);
             setError(err);
             onErrorRef.current?.(err);
@@ -223,7 +283,7 @@ export function useGoogleSTT({
     return () => {
       ws.removeEventListener("message", handleMessage);
     };
-  }, [wsRef.current, interimStabilityMs, clearStabilityTimer, promoteInterimToFinal]); // Re-attach when WebSocket changes
+  }, [wsRef.current, interimStabilityMs, clearStabilityTimer, promoteInterimToFinal, fallbackToWebSpeech]);
 
   // ─── Inactivity timer ───
   const resetInactivityTimer = useCallback(() => {
@@ -245,11 +305,18 @@ export function useGoogleSTT({
   }, [inactivityTimeout, promoteInterimToFinal]);
 
   // ─── Stop listening (internal) ───
-  const stopListeningInternal = useCallback(() => {
-    if (!isListeningRef.current) return;
+  const stopListeningInternal = useCallback((sendBackendStop = true) => {
+    if (!isListeningRef.current && !usingWebSpeechRef.current) return;
 
-    log.debug("🛑 Stopping Google STT...");
+    log.debug("🛑 Stopping STT...");
     isListeningRef.current = false;
+
+    if (usingWebSpeechRef.current) {
+      usingWebSpeechRef.current = false;
+      stopWebSpeechRef.current?.();
+      STTInstanceManager.unregister(instanceId.current);
+      return;
+    }
 
     // Unregister from global manager
     STTInstanceManager.unregister(instanceId.current);
@@ -269,13 +336,15 @@ export function useGoogleSTT({
     }
 
     // Tell backend to stop STT
-    try {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "stt_stop" }));
+    if (sendBackendStop) {
+      try {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "stt_stop" }));
+        }
+      } catch (err) {
+        log.error("Error sending stt_stop:", err);
       }
-    } catch (err) {
-      log.error("Error sending stt_stop:", err);
     }
 
     setIsListening(false);
@@ -339,7 +408,7 @@ export function useGoogleSTT({
       // Tell backend to start STT stream
       ws.send(JSON.stringify({
         type: "stt_start",
-        languageCode: config.languageCode || "ja-JP",
+        languageCode: config.languageCode || "en-US",
         sampleRate: config.sampleRate || 16000,
         model: config.model,
       }));
@@ -388,11 +457,11 @@ export function useGoogleSTT({
       // Enhanced error messages
       let userMessage = error.message;
       if (error.message.includes("Permission denied") || error.message.includes("not-allowed")) {
-        userMessage = "マイクの使用許可が必要です。ブラウザの設定を確認してください。";
+        userMessage = "Microphone permission is required. Please check your browser settings.";
       } else if (error.message.includes("NotFoundError")) {
-        userMessage = "マイクが見つかりません。マイクが接続されているか確認してください。";
+        userMessage = "No microphone found. Please check that a microphone is connected.";
       } else if (error.message.includes("WebSocket")) {
-        userMessage = "バックエンドに接続できません。サーバーが起動しているか確認してください。";
+        userMessage = "Cannot connect to backend. Please check that the server is running.";
       }
 
       const enhancedError = new Error(userMessage);
@@ -407,11 +476,11 @@ export function useGoogleSTT({
   }, [config, wsRef, stopListeningInternal, resetInactivityTimer, clearStabilityTimer]);
 
   return {
-    isListening,
-    transcript,
-    interimTranscript,
+    isListening: useWebSpeech ? webSpeech.isListening : isListening,
+    transcript: useWebSpeech ? webSpeech.transcript : transcript,
+    interimTranscript: useWebSpeech ? webSpeech.interimTranscript : interimTranscript,
     startListening,
     stopListening,
-    error,
+    error: useWebSpeech ? webSpeech.error : error,
   };
 }

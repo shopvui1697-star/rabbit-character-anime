@@ -26,9 +26,10 @@ export const config = {
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 
-  // Anthropic Claude (direct API)
+  // Anthropic Claude (direct API or compatible proxy such as 9Router)
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY || "",
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
     model: process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-20241022",
   },
 
@@ -48,13 +49,27 @@ export const config = {
     sslMode: process.env.DB_SSLMODE || "prefer",
   },
 
-  // Google Services
+  // Google Services (search only — TTS/STT use 9Router)
   google: {
     apiKey: process.env.GOOGLE_API_KEY || "",
     searchEngineId: process.env.GOOGLE_SEARCH_ENGINE_ID || "",
-    // Google Cloud TTS
     cloudApiKey: process.env.GOOGLE_CLOUD_API_KEY || process.env.GOOGLE_API_KEY || "",
-    ttsVoice: process.env.GOOGLE_TTS_VOICE || "ja-JP-Neural2-B",
+    ttsVoice: process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-F",
+  },
+
+  // 9Router (TTS + STT; reuses Anthropic URL/key when dedicated vars are unset)
+  ninerouter: {
+    baseUrl: process.env.NINEROUTER_URL || process.env.ANTHROPIC_BASE_URL || "http://localhost:20128",
+    apiKey: process.env.NINEROUTER_KEY || process.env.ANTHROPIC_API_KEY || "",
+    ttsVoiceFemale: process.env.NINEROUTER_TTS_VOICE_FEMALE || "edge-tts/en-US-JennyNeural",
+    ttsVoiceMale: process.env.NINEROUTER_TTS_VOICE_MALE || "edge-tts/en-US-GuyNeural",
+    sttModel: process.env.NINEROUTER_STT_MODEL || "groq/whisper-large-v3-turbo",
+    sttIntervalMs: parseInt(process.env.NINEROUTER_STT_INTERVAL_MS || "1200", 10),
+  },
+
+  // Direct Groq STT (bypasses 9Router when set; free tier at console.groq.com)
+  groq: {
+    apiKey: process.env.GROQ_API_KEY || "",
   },
 } as const;
 
@@ -83,5 +98,21 @@ export function validateConfig(): void {
     logger.info(`Bedrock Model: ${config.bedrock.modelId}`);
   } else {
     logger.info(`Anthropic Model: ${config.anthropic.model}`);
+    if (config.anthropic.baseURL) {
+      logger.info(`Anthropic Base URL: ${config.anthropic.baseURL} (9Router)`);
+    }
+  }
+
+  logger.info(`9Router URL: ${config.ninerouter.baseUrl}`);
+  logger.info(`9Router TTS voices: ${config.ninerouter.ttsVoiceFemale} / ${config.ninerouter.ttsVoiceMale}`);
+  logger.info(`9Router STT model: ${config.ninerouter.sttModel}`);
+  if (config.groq.apiKey) {
+    if (config.groq.apiKey.startsWith("gsk_")) {
+      logger.info("Groq STT: direct API enabled (GROQ_API_KEY set)");
+    } else {
+      logger.warn(
+        "GROQ_API_KEY is set but does not look like a valid Groq API key (expected gsk_...). STT will fail until fixed."
+      );
+    }
   }
 }

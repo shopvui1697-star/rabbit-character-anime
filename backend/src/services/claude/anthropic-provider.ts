@@ -9,9 +9,10 @@ import { createLogger } from "../../utils/logger.js";
 
 const log = createLogger("AnthropicProvider");
 
-// Initialize Anthropic client
+// Initialize Anthropic client (supports direct API or proxies like 9Router)
 const anthropic = new Anthropic({
   apiKey: config.anthropic.apiKey,
+  ...(config.anthropic.baseURL ? { baseURL: config.anthropic.baseURL } : {}),
 });
 
 export interface AnthropicRequest {

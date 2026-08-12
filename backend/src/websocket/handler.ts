@@ -1,7 +1,7 @@
 import { WebSocket } from "ws";
 import { v4 as uuidv4 } from "uuid";
 import { chat, needsMovieSearch, needsGourmetSearch, needsSearch } from "../services/claude.js";
-import { synthesizeSpeechBase64 } from "../services/gemini-tts.js";
+import { synthesizeSpeechBase64 } from "../services/ninerouter/tts.js";
 import { searchMovies } from "../db/movies.js";
 import { searchGourmetRestaurants } from "../db/gourmet.js";
 import { combinedMovieSearch } from "../services/combined-search.js";
@@ -11,7 +11,11 @@ import { createLogger, createUserLogger, setUserId, clearUserId } from "../utils
 import { saveConversationTurn, getConversationHistoryByUserId, recordsToTurns } from "../db/conversation.js";
 import { detectDomain } from "../utils/domain-detector.js";
 import { getRandomUser, userProfileToContext, type UserContext } from "../db/user-profile.js";
-import { GoogleSTTSession, createGoogleSTTSession, type GoogleSTTConfig } from "../services/google-stt.js";
+import {
+  NineRouterSTTSession,
+  createNineRouterSTTSession,
+  type NineRouterSTTConfig,
+} from "../services/ninerouter/stt.js";
 
 const log = createLogger("WS");
 
@@ -90,26 +94,26 @@ const MAX_REQUESTS_PER_MINUTE = 20;  // Rate limiting per session
 
 // Waiting phrases - played before database search (pre-recorded audio)
 const WAITING_PHRASES = [
-  "もちろん。急いで確認するから、待っててね。",
-  "了解。ちょっと待ってね。",
-  "うん、わかった。今確認するから待っててね。",
-  "なるほど。少し調べてみるから待ってて。",
-  "OK。内容を確認するから、少々お待ちを。",
-  "任せて。丁寧にお調べするから、少し待っててね。",
-  "承知したよ。ちょっと考えるから待っててくれる？",
-  "あ、そのことだね。今調べてあげるから待って。",
-  "確かに。すぐ確認するから、ちょっと待ってて。",
-  "いいよ。調べてみるから、そこで待っててね。",
-  "うん、わかるよ。すぐに調べてみるね。",
-  "おっけー。情報を探してくるから、待っててね。",
-  "了解了解。落ち着いて調べるから、待っててね。",
-  "そうだね。すぐ確認するから、ちょっと待って。",
-  "お安い御用だよ。今すぐ調べるから待っててね。",
-  "オッケー。しっかり探してみるから、待ってて。",
-  "そうだよね。今、詳しく確認するからちょっと待って。",
-  "おっけー。すぐ準備するから、ちょっと待っててね。",
-  "教えてくれてありがとう。今すぐ調べるから待ってて。",
-  "了解したよ。すぐに見つけてくるから、待っててね。",
+  "Sure thing. Let me check on that real quick.",
+  "Got it. Give me a moment.",
+  "Okay, I'll look that up for you.",
+  "Alright, let me dig into that.",
+  "On it. I'll confirm the details for you.",
+  "Leave it to me. I'll search carefully.",
+  "Got it. Let me think about that for a sec.",
+  "Ah, that one. Let me look it up.",
+  "Right. I'll verify that right away.",
+  "Sure. I'll search for that now.",
+  "Yeah, I know what you mean. Let me check.",
+  "Okay. I'll go find that info for you.",
+  "Got it, got it. I'll take my time and look.",
+  "Yeah. I'll confirm that in just a moment.",
+  "Easy. I'll search for that right now.",
+  "Okay. I'll do a thorough search for you.",
+  "Right. Let me check the details now.",
+  "Okay. I'll get that ready for you.",
+  "Thanks for telling me. I'll look that up now.",
+  "Understood. I'll find that for you.",
 ];
 
 // Workflow step definitions matching WORKFLOW.md
@@ -156,7 +160,7 @@ interface Session {
   // Active result set for numbered voice selection
   activeResults: ActiveResultSet | null;
   // Google STT streaming session
-  sttSession: GoogleSTTSession | null;
+  sttSession: NineRouterSTTSession | null;
 }
 
 // Active sessions
@@ -603,12 +607,18 @@ const HIRAGANA_TO_NUMBER: Record<string, number> = {
   'いち': 1, 'に': 2, 'さん': 3, 'よん': 4, 'ご': 5,
 };
 
+const ENGLISH_ORDINAL_TO_NUMBER: Record<string, number> = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+};
+
 /**
  * Extract a 1-based selection number from user text
- * Handles: 1番, 10番, 20番, ２番, 一番, いちばん, 1つ目, 一つ目
+ * Handles: number 2, #2, second, 1番, 10番, 一番, いちばん, etc.
  */
 function extractSelectionNumber(text: string): number | null {
   const patterns: Array<{ pattern: RegExp; extract: (m: RegExpMatchArray) => number | null }> = [
+    { pattern: /(?:number|#|item)\s*([1-9]\d*)/i, extract: m => parseInt(m[1]) },
+    { pattern: /\b(first|second|third|fourth|fifth)\b/i, extract: m => ENGLISH_ORDINAL_TO_NUMBER[m[1].toLowerCase()] ?? null },
     { pattern: /([1-9]\d*)番/, extract: m => parseInt(m[1]) },
     { pattern: /([１-９])番/, extract: m => KANJI_TO_NUMBER[m[1]] ?? null },
     { pattern: /([一二三四五六七八九])番/, extract: m => KANJI_TO_NUMBER[m[1]] ?? null },
@@ -724,7 +734,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
     workflow.startStep("STEP3_BACKEND_START");
     sendUserMessage(ws, userText);
     session.status = "thinking";
-    sendStatus(ws, "thinking", "thinking", "考え中...");
+    sendStatus(ws, "thinking", "thinking", "Thinking...");
     sessionLog.debug("Backend processing started");
     workflow.endStep();
 
@@ -747,7 +757,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
           const entityName = getItemName(selectedItem, session.activeResults.type);
           
           // Inject resolved entity context into the user message for LLM
-          enrichedUserText = `[ユーザーが「${entityName}」を選択] ${userText}`;
+          enrichedUserText = `[User selected "${entityName}"] ${userText}`;
           sessionLog.info(`🔢 Number selection: ${selectionNumber}番 → "${entityName}" (index: ${index})`);
           
           // Send item_focused to frontend so the card gets highlighted
@@ -1164,7 +1174,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
     workflow.startStep("STEP7_TEXT_RESPONSE");
     sendAssistantMessage(ws, response.text, response.emotion, assistantMessageId, domain, foundArchiveItem, allSearchResults, hasSentenceSync);
     session.status = "speaking";
-    sendStatus(ws, "speaking", response.emotion, "話しています...");
+    sendStatus(ws, "speaking", response.emotion, "Speaking...");
     workflow.endStep({ textLength: response.text.length, emotion: response.emotion, sentenceSync: hasSentenceSync });
 
     // STEP 8: TTS synthesis (parallel mode or fallback)
@@ -1294,7 +1304,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
           workflow.endStep({ error: true });
           send(ws, {
             type: "tts_error",
-            message: "音声生成に失敗しました",
+            message: "Failed to generate audio",
           });
         }
       }
@@ -1329,7 +1339,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
       workflow.logSummary();
       session.status = "idle";
       sendStatus(ws, "idle", "confused", "");
-      sendError(ws, "エラーが発生しました。もう一度お試しください。");
+      sendError(ws, "An error occurred. Please try again.");
     }
   } finally {
     // Always reset pending flag
@@ -1356,14 +1366,14 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           // Validate message length
           if (trimmedText.length > MAX_MESSAGE_LENGTH) {
             session.log.warn(`Message too long: ${trimmedText.length} chars`);
-            sendError(session.ws, `メッセージが長すぎます（最大${MAX_MESSAGE_LENGTH}文字）`);
+            sendError(session.ws, `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)`);
             return;
           }
 
           // Check rate limit
           if (!checkRateLimit(session)) {
             session.log.warn("Rate limit exceeded");
-            sendError(session.ws, "リクエストが多すぎます。少し待ってからお試しください。");
+            sendError(session.ws, "Too many requests. Please wait a moment and try again.");
             return;
           }
 
@@ -1424,7 +1434,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         
         if (!loadMsg.userId) {
           session.log.warn("Invalid load_history message: missing userId");
-          sendError(session.ws, "ユーザーIDが必要です");
+          sendError(session.ws, "User ID is required");
           return;
         }
 
@@ -1448,7 +1458,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           send(session.ws, historyMsg);
         } catch (error) {
           session.log.error("Failed to load history:", error);
-          sendError(session.ws, "履歴の読み込みに失敗しました");
+          sendError(session.ws, "Failed to load history");
         }
         break;
       }
@@ -1458,7 +1468,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         
         if (!archiveMsg.userId || !archiveMsg.domain || !archiveMsg.itemId) {
           session.log.warn("Invalid save_archive message: missing required fields");
-          sendError(session.ws, "保存に必要な情報が不足しています");
+          sendError(session.ws, "Missing information required to save");
           return;
         }
 
@@ -1484,14 +1494,14 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           send(session.ws, {
             type: "archive_saved",
             success: true,
-            message: "アーカイブに保存しました",
+            message: "Saved to archive",
             itemId: archiveMsg.itemId,
             domain: archiveMsg.domain,
             friends_matched: friendsMatched,
           });
         } catch (error) {
           session.log.error("Failed to save to archive:", error);
-          sendError(session.ws, "アーカイブへの保存に失敗しました");
+          sendError(session.ws, "Failed to save to archive");
         }
         break;
       }
@@ -1500,10 +1510,9 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         session.log.info("👋 Greeting requested");
         
         // Personalized greeting if user context is available
-        let greeting = "こんにちは！";
+        let greeting = "Hello!";
         if (session.userContext?.nickName) {
-          // Use user's nickname for personalized greeting
-          greeting = `やっほー、${session.userContext.nickName}！元気？`;
+          greeting = `Hey, ${session.userContext.nickName}! How are you?`;
           session.log.info(`📋 Personalized greeting for ${session.userContext.nickName}`);
         } else {
           session.log.debug("No user context available for personalization");
@@ -1550,7 +1559,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           
           // If action is "detail", trigger an auto-response about the item
           if (action === "detail") {
-            const detailText = `[ユーザーが「${entityName}」を選択] ${index + 1}番について教えて`;
+            const detailText = `[User selected "${entityName}"] Tell me about item ${index + 1}`;
             await processUserInput(session, detailText);
           }
           // If action is "save", the frontend handles it directly via save_archive
@@ -1583,14 +1592,14 @@ async function handleMessage(session: Session, data: string): Promise<void> {
               // Validate message length
               if (trimmedText.length > MAX_MESSAGE_LENGTH) {
                 session.log.warn(`Message too long: ${trimmedText.length} chars`);
-                sendError(session.ws, `メッセージが長すぎます（最大${MAX_MESSAGE_LENGTH}文字）`);
+                sendError(session.ws, `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)`);
                 return;
               }
               
               // Check rate limit
               if (!checkRateLimit(session)) {
                 session.log.warn("Rate limit exceeded");
-                sendError(session.ws, "リクエストが多すぎます。少し待ってからお試しください。");
+                sendError(session.ws, "Too many requests. Please wait a moment and try again.");
                 return;
               }
               
@@ -1637,7 +1646,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
             
             if (!userId) {
               session.log.warn("Invalid load_history: missing userId");
-              sendError(session.ws, "ユーザーIDが必要です");
+              sendError(session.ws, "User ID is required");
               return;
             }
             
@@ -1655,7 +1664,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
               send(session.ws, historyMsg);
             } catch (error) {
               session.log.error("Failed to load history:", error);
-              sendError(session.ws, "履歴の読み込みに失敗しました");
+              sendError(session.ws, "Failed to load history");
             }
             break;
           }
@@ -1669,7 +1678,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
             
             if (!userId || !domain || !itemId) {
               session.log.warn("Invalid save_archive: missing required fields");
-              sendError(session.ws, "保存に必要な情報が不足しています");
+              sendError(session.ws, "Missing information required to save");
               return;
             }
             
@@ -1682,14 +1691,14 @@ async function handleMessage(session: Session, data: string): Promise<void> {
               send(session.ws, {
                 type: "archive_saved",
                 success: true,
-                message: "アーカイブに保存しました",
+                message: "Saved to archive",
                 itemId,
                 domain,
                 friends_matched: friendsMatched,
               });
             } catch (error) {
               session.log.error("Failed to save to archive:", error);
-              sendError(session.ws, "アーカイブへの保存に失敗しました");
+              sendError(session.ws, "Failed to save to archive");
             }
             break;
           }
@@ -1697,9 +1706,9 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           case "request_greeting": {
             session.log.info("👋 Greeting requested (voice_event)");
             
-            let greeting = "こんにちは！";
+            let greeting = "Hello!";
             if (session.userContext?.nickName) {
-              greeting = `やっほー、${session.userContext.nickName}！元気？`;
+              greeting = `Hey, ${session.userContext.nickName}! How are you?`;
             }
             
             sendAssistantMessage(session.ws, greeting, "happy");
@@ -1735,15 +1744,14 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         break;
       }
 
-      // ─── Google STT Streaming Messages ───
+      // ─── 9Router STT Messages (buffered streaming) ───
       case "stt_start": {
-        // Start a new Google STT streaming session
-        const sttConfig: GoogleSTTConfig = {
-          languageCode: (message as any).languageCode || "ja-JP",
+        const sttConfig: NineRouterSTTConfig = {
+          languageCode: (message as any).languageCode || "en-US",
           sampleRateHertz: (message as any).sampleRate || 16000,
           encoding: (message as any).encoding || "LINEAR16",
           enableInterimResults: true,
-          model: (message as any).model || "default",
+          model: (message as any).model,
         };
 
         // Stop existing session if any
@@ -1754,7 +1762,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         }
 
         try {
-          session.sttSession = createGoogleSTTSession(sttConfig, {
+          session.sttSession = createNineRouterSTTSession(sttConfig, {
             onTranscript: (text, isFinal, confidence) => {
               send(session.ws, {
                 type: "stt_transcript",
@@ -1764,26 +1772,26 @@ async function handleMessage(session: Session, data: string): Promise<void> {
               } as any);
             },
             onError: (error) => {
-              session.log.error("Google STT error:", error);
+              session.log.error("9Router STT error:", error);
               send(session.ws, {
                 type: "stt_error",
                 error: error.message,
               } as any);
             },
             onStarted: () => {
-              session.log.debug("Google STT stream started");
+              session.log.debug("9Router STT session started");
               send(session.ws, { type: "stt_started" } as any);
             },
             onStopped: () => {
-              session.log.debug("Google STT stream stopped");
+              session.log.debug("9Router STT session stopped");
               send(session.ws, { type: "stt_stopped" } as any);
             },
           });
 
           await session.sttSession.start();
-          session.log.info("🎙️ Google STT session started", { config: sttConfig });
+          session.log.info("🎙️ 9Router STT session started", { config: sttConfig });
         } catch (error) {
-          session.log.error("Failed to start Google STT:", error);
+          session.log.error("Failed to start 9Router STT:", error);
           send(session.ws, {
             type: "stt_error",
             error: `Failed to start speech recognition: ${error instanceof Error ? error.message : String(error)}`,
@@ -1794,7 +1802,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
       }
 
       case "stt_audio": {
-        // Forward audio data to Google STT stream
+        // Forward audio data to 9Router STT buffer
         if (session.sttSession) {
           try {
             const base64Data = (message as any).data;
@@ -1810,11 +1818,10 @@ async function handleMessage(session: Session, data: string): Promise<void> {
       }
 
       case "stt_stop": {
-        // Stop the Google STT streaming session
         if (session.sttSession) {
           session.sttSession.stop();
           session.sttSession = null;
-          session.log.info("🛑 Google STT session stopped");
+          session.log.info("🛑 9Router STT session stopped");
         }
         break;
       }
@@ -1826,7 +1833,7 @@ async function handleMessage(session: Session, data: string): Promise<void> {
   } catch (error) {
     session.log.error("Handle message error:", error);
     log.error("Handle message error:", error);
-    sendError(session.ws, "メッセージの処理に失敗しました");
+    sendError(session.ws, "Failed to process message");
   }
 }
 
@@ -1876,7 +1883,7 @@ export function handleConnection(ws: WebSocket): void {
   send(ws, {
     type: "connected",
     sessionId,
-    message: "ラビットAIに接続しました！",
+    message: "Connected to Rabbit AI!",
   });
 
   // Send initial status

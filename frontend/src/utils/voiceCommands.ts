@@ -81,6 +81,9 @@ export const COMMAND_KEYWORDS: Record<CommandType, string[]> = {
   // Select commands - numbered selection ("2番", "二番目")
   // Note: for numbers beyond this list, detectCommand uses regex fallback
   select: [
+    // English
+    "first", "second", "third", "fourth", "fifth",
+    "number one", "number two", "number three",
     // Kanji / Hiragana (single-digit only, no regex equivalent)
     "一番", "いちばん",
     "二番", "にばん",
@@ -96,6 +99,7 @@ export const COMMAND_KEYWORDS: Record<CommandType, string[]> = {
 
   // Detail commands - ask for more info
   detail: [
+    "tell me more", "more details", "about that", "what's it about", "details",
     "詳しく", "もっと教えて", "それについて",
     "どんな映画", "どんなお店",
     "もっと詳しく", "詳細",
@@ -103,12 +107,14 @@ export const COMMAND_KEYWORDS: Record<CommandType, string[]> = {
 
   // Next commands - show more results
   next: [
+    "next", "next one", "show more", "anything else", "more results",
     "次", "次の", "他にある", "もっと見せて",
     "次のページ",
   ],
 
   // Previous commands - go back
   previous: [
+    "previous", "go back", "last one", "the one before",
     "前の", "戻って", "さっきの",
     "前のページ",
   ],

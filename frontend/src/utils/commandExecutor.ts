@@ -91,7 +91,7 @@ function saveMovie(
 ): CommandResult {
   const movie = results.movies?.[index];
   if (!movie) {
-    return fail(`${index + 1}番の映画が見つかりません`);
+    return fail(`Couldn't find movie #${index + 1}`);
   }
   const itemId = movie.id?.toString() || `movie-${Date.now()}`;
   saveToArchive(userId, "movie", itemId, movie.title_ja, {
@@ -103,7 +103,7 @@ function saveMovie(
     actors: movie.actors,
   });
   log.info(`✅ Saved movie #${index + 1} "${movie.title_ja}" (${itemId})`);
-  return ok(`${movie.title_ja}をアーカイブに保存しました`);
+  return ok(`Saved ${movie.title_ja} to archive`);
 }
 
 /** Save a gourmet item by index, returns CommandResult */
@@ -115,7 +115,7 @@ function saveGourmet(
 ): CommandResult {
   const restaurant = results.restaurants?.[index];
   if (!restaurant) {
-    return fail(`${index + 1}番のお店が見つかりません`);
+    return fail(`Couldn't find restaurant #${index + 1}`);
   }
   const itemId = restaurant.id?.toString() || `gourmet-${Date.now()}`;
   saveToArchive(userId, "gourmet", itemId, restaurant.name, {
@@ -128,7 +128,7 @@ function saveGourmet(
     access: restaurant.access,
   });
   log.info(`✅ Saved restaurant #${index + 1} "${restaurant.name}" (${itemId})`);
-  return ok(`${restaurant.name}をアーカイブに保存しました`);
+  return ok(`Saved ${restaurant.name} to archive`);
 }
 
 // ============================================================================
@@ -144,7 +144,7 @@ const COMMAND_HANDLERS: Record<CommandType, CommandHandler> = {
    *   3. Most recent item from FILO storage (archiveStorage.peek())
    */
   save: ({ userId, saveToArchive, originalText, messages, selectedIndex }) => {
-    if (!userId) return fail("ログインしてください");
+    if (!userId) return fail("Please log in");
 
     const results = findLatestSearchResults(messages);
 
@@ -172,11 +172,11 @@ const COMMAND_HANDLERS: Record<CommandType, CommandHandler> = {
 
     // Fallback: save most recent item from FILO storage
     const item = archiveStorage.peek();
-    if (!item) return fail("保存できるアイテムが見つかりません");
+    if (!item) return fail("No item available to save");
 
     saveToArchive(userId, item.itemDomain, item.itemId, item.itemTitle, item.itemData);
     log.info(`✅ Saved (fallback): ${item.itemTitle} (${item.itemDomain}:${item.itemId})`);
-    return ok(`${item.itemTitle}をアーカイブに保存しました`);
+    return ok(`Saved ${item.itemTitle} to archive`);
   },
 
   // Backend-forwarded commands
@@ -186,9 +186,9 @@ const COMMAND_HANDLERS: Record<CommandType, CommandHandler> = {
   previous: () => forward(),
 
   // Unimplemented commands
-  delete: () => fail("削除機能は準備中です"),
-  list:   () => fail("リスト表示機能は準備中です"),
-  clear:  () => fail("クリア機能は準備中です"),
+  delete: () => fail("Delete is not available yet"),
+  list:   () => fail("List view is not available yet"),
+  clear:  () => fail("Clear is not available yet"),
 };
 
 // ============================================================================
@@ -202,13 +202,13 @@ export function executeCommand(
 ): CommandResult {
   const handler = COMMAND_HANDLERS[commandType];
   if (!handler) {
-    return fail(`コマンド "${commandType}" は実装されていません`);
+    return fail(`Command "${commandType}" is not implemented`);
   }
 
   try {
     return handler(context);
   } catch (error) {
     log.error(`❌ Command execution failed:`, error);
-    return fail("コマンドの実行に失敗しました");
+    return fail("Failed to run command");
   }
 }

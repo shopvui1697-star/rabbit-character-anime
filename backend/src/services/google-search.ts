@@ -76,14 +76,14 @@ export async function searchGoogle(query: string): Promise<GoogleSearchResponse>
 
   try {
     // Add movie-related context to search query for better results
-    const searchQuery = `${query} 映画 あらすじ`;
+    const searchQuery = `${query} movie plot summary`;
 
     const url = new URL("https://www.googleapis.com/customsearch/v1");
     url.searchParams.set("key", apiKey);
     url.searchParams.set("cx", searchEngineId);
     url.searchParams.set("q", searchQuery);
     url.searchParams.set("num", "5"); // Limit to 5 results
-    url.searchParams.set("lr", "lang_ja"); // Prefer Japanese results
+    url.searchParams.set("lr", "lang_en"); // Prefer English results
     url.searchParams.set("safe", "active"); // Safe search
 
     log.debug(`Google search: "${query}" -> "${searchQuery}"`);
@@ -139,12 +139,12 @@ export async function searchGoogle(query: string): Promise<GoogleSearchResponse>
  */
 export function formatGoogleResults(response: GoogleSearchResponse): string {
   if (response.results.length === 0) {
-    return "【ウェブ検索結果】\n結果なし";
+    return "[Web search results]\nNo results";
   }
 
   const lines = response.results.map((result, i) => {
     return `${i + 1}. ${result.title}\n   ${result.snippet}`;
   });
 
-  return `【ウェブ検索結果】\n${lines.join("\n\n")}`;
+  return `[Web search results]\n${lines.join("\n\n")}`;
 }

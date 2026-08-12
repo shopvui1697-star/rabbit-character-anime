@@ -4,30 +4,26 @@ import type { EmotionType } from "../types/index.js";
  * Emotion detection and mapping utilities
  */
 
-// Japanese emotion keywords for detection
+// Emotion keywords for detection (English)
 const EMOTION_KEYWORDS: Record<EmotionType, string[]> = {
   happy: [
-    "嬉しい", "楽しい", "幸せ", "喜び", "素敵", "いいね", "良い", "最高",
-    "ありがとう", "感謝", "素晴らしい", "うれしい", "たのしい"
+    "happy", "glad", "great", "awesome", "nice", "good", "love", "thanks", "thank you",
+    "wonderful", "perfect", "excited"
   ],
   excited: [
-    "ワクワク", "興奮", "すごい", "やった", "わーい", "やばい", "最高",
-    "びっくり", "面白い", "おもしろい"
+    "wow", "amazing", "incredible", "yes", "yay", "cool", "fun", "interesting", "awesome"
   ],
   sad: [
-    "悲しい", "寂しい", "つらい", "残念", "かなしい", "さみしい",
-    "切ない", "泣く", "涙", "悔しい"
+    "sad", "sorry", "unfortunately", "miss", "lonely", "tough", "hard", "upset", "disappointed"
   ],
   surprised: [
-    "驚き", "びっくり", "まさか", "えっ", "おどろき", "意外", "本当"
+    "surprised", "really", "wait", "what", "no way", "unexpected", "actually"
   ],
   thinking: [
-    "考える", "思う", "かもしれない", "たぶん", "おそらく", "どうかな",
-    "難しい", "むずかしい", "分からない", "わからない"
+    "think", "maybe", "probably", "perhaps", "not sure", "wonder", "hard to say", "difficult"
   ],
   confused: [
-    "困る", "こまる", "よくわからない", "どうすれば", "えーと",
-    "うーん", "はて", "困惑"
+    "confused", "don't understand", "not sure", "hmm", "what do you mean", "unclear"
   ],
   neutral: [],
   listening: [],
@@ -103,13 +99,13 @@ export const EMOTION_DISPLAY: Record<
   EmotionType,
   { face: string; label: string; color: string }
 > = {
-  neutral: { face: "(・ω・)", label: "普通", color: "#6B7280" },
-  happy: { face: "(◕‿◕)", label: "嬉しい", color: "#F59E0B" },
-  excited: { face: "(★▽★)", label: "ワクワク", color: "#EF4444" },
-  thinking: { face: "(・_・?)", label: "考え中", color: "#06B6D4" },
-  sad: { face: "(´・ω・`)", label: "悲しい", color: "#6B7280" },
-  surprised: { face: "(°o°)", label: "驚き", color: "#F59E0B" },
-  confused: { face: "(・・?)", label: "困惑", color: "#8B5CF6" },
-  listening: { face: "(・ω・)🎤", label: "聞いています", color: "#10B981" },
-  speaking: { face: "(・ω・)♪", label: "話しています", color: "#3B82F6" },
+  neutral: { face: "(・ω・)", label: "Neutral", color: "#6B7280" },
+  happy: { face: "(◕‿◕)", label: "Happy", color: "#F59E0B" },
+  excited: { face: "(★▽★)", label: "Excited", color: "#EF4444" },
+  thinking: { face: "(・_・?)", label: "Thinking", color: "#06B6D4" },
+  sad: { face: "(´・ω・`)", label: "Sad", color: "#6B7280" },
+  surprised: { face: "(°o°)", label: "Surprised", color: "#F59E0B" },
+  confused: { face: "(・・?)", label: "Confused", color: "#8B5CF6" },
+  listening: { face: "(・ω・)🎤", label: "Listening", color: "#10B981" },
+  speaking: { face: "(・ω・)♪", label: "Speaking", color: "#3B82F6" },
 };

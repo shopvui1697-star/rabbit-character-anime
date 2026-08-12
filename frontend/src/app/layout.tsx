@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Lovvit Archive",
-  description: "Lovvit Archive - ラビットAIアシスタント",
+  description: "Lovvit Archive - Rabbit AI assistant",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
@@ -29,7 +29,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="ja">
+    <html lang="en">
       <head>
         <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
         {/* Suppress Next.js 15 development warnings */}

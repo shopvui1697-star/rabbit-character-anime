@@ -28,12 +28,12 @@ const STATUS_COLORS: Record<ConversationStatus, string> = {
   speaking: "#60a5fa",   // Blue - outputting response
 };
 
-// Status labels in Japanese
+// Status labels in English
 const STATUS_LABELS: Record<ConversationStatus, string> = {
-  idle: "待機中",
-  listening: "聞いています...",
-  thinking: "考え中...",
-  speaking: "話しています...",
+  idle: "Idle",
+  listening: "Listening...",
+  thinking: "Thinking...",
+  speaking: "Speaking...",
 };
 
 // Status icons
@@ -69,7 +69,7 @@ export function RabbitAvatar({
       {/* Connection status badge */}
       <div className={`${styles.connectionBadge} ${isConnected ? styles.connected : styles.disconnected}`}>
         <span className={styles.connectionDot} />
-        {isConnected ? "接続中" : "未接続"}
+        {isConnected ? "Connected" : "Disconnected"}
       </div>
 
       {/* Lottie Character Animation */}

@@ -40,7 +40,7 @@ export function isWebSpeechSupported(): boolean {
  * Web Speech API fallback hook
  */
 export function useWebSpeechFallback({
-  languageCode = "ja-JP",
+  languageCode = "en-US",
   onTranscript,
   onError,
   onStart,

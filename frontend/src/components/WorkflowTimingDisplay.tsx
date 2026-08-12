@@ -176,7 +176,7 @@ export function WorkflowTimingDisplay({ timing }: WorkflowTimingDisplayProps) {
       {/* Tool Info */}
       {timing.usedTool && timing.hasDbSearch && (
         <div className={styles.toolInfo}>
-          <span>🔍 DB検索: {formatDuration(timing.dbSearchTime)}</span>
+          <span>🔍 DB search: {formatDuration(timing.dbSearchTime)}</span>
         </div>
       )}
     </div>

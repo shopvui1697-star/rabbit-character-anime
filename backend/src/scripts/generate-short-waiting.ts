@@ -4,15 +4,15 @@
  * Creates short acknowledgment sounds using Google TTS
  * with the same voice as the main responses for consistency.
  * 
- * IMPORTANT: Uses synthesizeSpeech() which outputs MP3/24000Hz —
- * this MUST match the realtime TTS settings in gemini-tts.ts
+ * IMPORTANT: Uses synthesizeSpeech() which outputs MP3 —
+ * this MUST match the realtime TTS settings in ninerouter/tts.ts
  * to ensure uniform voice (same encoding, sample rate, and loudness).
  * Frontend expects .mp3 files at /waiting-short/{i}.mp3
  * 
  * Usage: npm run generate:short-waiting
  */
 
-import { synthesizeSpeech } from "../services/gemini-tts.js";
+import { synthesizeSpeech } from "../services/ninerouter/tts.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -27,38 +27,27 @@ const __dirname = dirname(__filename);
 const OUTPUT_DIR = join(__dirname, "../../../frontend/public/waiting-short");
 
 // Short waiting phrases (< 1 second each)
-// These are natural Japanese filler sounds/acknowledgments
 const SHORT_WAITING_PHRASES = [
-  // "ああ",           // 0: ah (acknowledgment)
-  // "うん",           // 1: un (yes/acknowledgment)
-  // "えっと",         // 2: etto (um/well)
-  // "そうだね",       // 3: sou da ne (I see)
-  // "なるほど",       // 4: naruhodo (I understand)
-  // "ふむ",           // 5: fumu (hmm)
-  // "へぇ",           // 6: hee (oh/interesting)
-  // "そっか",         // 7: sokka (I see)
-  // "うーん",         // 8: uun (hmm)
-  // "わかった",       // 9: wakatta (got it)
-  "今からちょっと確認するね。",
-  "うん、今確認してるよ。",
-  "OK、少し待っててね。",
-  "任せて、探してみるね。",
-  "ちょっと考えてみるね。",
-  "うんうん、今見てるよ。",
-  "今確認するね。",
-  "今調べてるよ。",
-  "すぐ確認するね。",
-  "うん、ちょっと待ってね。",
-  "了解、今チェックしてるよ。",
-  "OK、今確認中だよ。",
-  "ちょっと待ってね、今確認するね。",
-  "はーい、少し待ってね。",
-  "今対応するね。",
-  "えっと、確認してみるね。",
-  "大丈夫、任せてね。",
-  "今確認してるから、少し待ってね。",
-  "今探してるところだよ。",
-  "ちょっとだけ時間もらうね。"
+  "Let me check that real quick.",
+  "Yeah, I'm looking now.",
+  "OK, give me a sec.",
+  "On it, I'll search for that.",
+  "Let me think about that.",
+  "Yeah yeah, I'm on it.",
+  "Checking now.",
+  "Looking that up.",
+  "I'll verify that right away.",
+  "Just a sec.",
+  "Got it, checking now.",
+  "OK, still checking.",
+  "Hold on, checking now.",
+  "Sure, one moment.",
+  "On it now.",
+  "Let me confirm that.",
+  "No problem, I've got it.",
+  "Still checking, just a sec.",
+  "Searching now.",
+  "Need a moment for this.",
 ];
 
 /**

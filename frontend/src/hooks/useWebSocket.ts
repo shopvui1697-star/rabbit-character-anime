@@ -168,7 +168,7 @@ export function useWebSocket({
 
     ws.onerror = (event) => {
       log.error("WebSocket error:", event);
-      setError("接続エラーが発生しました");
+      setError("Connection error occurred");
     };
 
     ws.onmessage = (event) => {

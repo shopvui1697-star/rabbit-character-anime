@@ -9,7 +9,7 @@ import type { ConversationTurn, EmotionType, MovieSearchResult, ActiveResultSet 
 const log = createLogger("Claude");
 
 // Stop sequences for Claude
-const STOP_SEQUENCES = ["以上です。", "おわり。", "<END>"];
+const STOP_SEQUENCES = ["That's all.", "End.", "<END>"];
 
 // Tighter token limits for conversational style (speaker, not writer)
 // 1 sentence ideal, max 2 sentences for natural spoken response
@@ -21,26 +21,26 @@ const MAX_TOKENS_TOOL_FOLLOWUP = 400;  // Summary of search results with numbere
 const tools: Anthropic.Tool[] = [
   {
     name: "search_movies",
-    description: "映画・ドラマ・アニメを検索。知らない作品名、固有名詞、不明な単語があれば積極的に検索する。作品名は元の表記のまま検索する（翻訳不要）",
+    description: "Search movies, TV shows, and anime. Use whenever you don't know a title or need fresh data. Search titles in their original spelling (no translation).",
     input_schema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "作品名、キーワード、または不明な固有名詞（英語・日本語・カタカナどれでもOK、元の表記のまま検索。「映画」「movie」等の一般語は除外し、固有名詞のみ）" },
-        genre: { type: "string", description: "ジャンル" },
-        year: { type: "number", description: "公開年" },
+        query: { type: "string", description: "Title, keyword, or proper noun (any language, original spelling). Exclude generic words like 'movie' or 'film' — proper nouns only." },
+        genre: { type: "string", description: "Genre" },
+        year: { type: "number", description: "Release year" },
       },
       required: ["query"],
     },
   },
   {
     name: "gourmet_search",
-    description: "レストラン・飲食店を検索。エリア、料理ジャンル、店名などで検索する。店名は元の表記のまま検索する（翻訳不要）",
+    description: "Search restaurants and dining spots by area, cuisine, or name. Search names in their original spelling (no translation).",
     input_schema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "店名、料理ジャンル、キーワード（英語・日本語・カタカナどれでもOK、元の表記のまま検索。「レストラン」「restaurant」等の一般語は除外し、固有名詞のみ）" },
-        area: { type: "string", description: "エリア・地域名（例：新宿、渋谷、銀座）" },
-        cuisine: { type: "string", description: "料理の種類（例：イタリアン、和食、寿司）" },
+        query: { type: "string", description: "Restaurant name, cuisine, or keyword (any language, original spelling). Exclude generic words like 'restaurant' — proper nouns only." },
+        area: { type: "string", description: "Area or neighborhood (e.g. Shinjuku, downtown)" },
+        cuisine: { type: "string", description: "Cuisine type (e.g. Italian, sushi, Thai)" },
       },
       required: ["query"],
     },
@@ -63,38 +63,38 @@ const responseCache = new Map<string, CacheEntry>();
 // NOTE: Avoid starting with short interjections (ああ, うん, えっと, わぁ, etc.)
 // as frontend already plays these as waiting sounds
 const INSTANT_RESPONSES: Map<RegExp, ChatResponse> = new Map([
-  [/^(こんにちは|こんにちわ|hello|hi|ハロー)$/i, {
-    text: "元気？なんか話そうよ！",
+  [/^(こんにちは|こんにちわ|hello|hi|hey)$/i, {
+    text: "Hey! What's up?",
     emotion: "happy" as EmotionType,
     usedTool: false
   }],
   [/^(ありがとう|ありがとうございます|thanks|thank you)$/i, {
-    text: "いえいえ〜！また何かあったら言ってね！",
+    text: "You're welcome! Let me know if you need anything else!",
     emotion: "happy" as EmotionType,
     usedTool: false
   }],
   [/^(さようなら|バイバイ|bye|goodbye)$/i, {
-    text: "またね〜！いつでも話しかけてね！",
+    text: "See you later! Talk anytime!",
     emotion: "happy" as EmotionType,
     usedTool: false
   }],
-  [/^(はい|うん|ok|okay)$/i, {
-    text: "で、どうしたの？",
+  [/^(はい|うん|ok|okay|yes|yeah)$/i, {
+    text: "So what's going on?",
     emotion: "neutral" as EmotionType,
     usedTool: false
   }],
-  [/^(おはよう|おはようございます)$/i, {
-    text: "おはよ〜！今日も一日頑張ろうね！",
+  [/^(おはよう|おはようございます|good morning)$/i, {
+    text: "Good morning! Let's make today a good one!",
     emotion: "happy" as EmotionType,
     usedTool: false
   }],
-  [/^(疲れた|つかれた)$/i, {
-    text: "お疲れさま〜！ゆっくり休んでね！",
+  [/^(疲れた|つかれた|i'm tired|im tired|tired)$/i, {
+    text: "You worked hard! Get some rest!",
     emotion: "sad" as EmotionType,
     usedTool: false
   }],
-  [/^(暇|ひま|ヒマ)$/i, {
-    text: "じゃあ一緒に何か話そうよ！",
+  [/^(暇|ひま|ヒマ|i'm bored|im bored|bored)$/i, {
+    text: "Let's chat! Got anything in mind?",
     emotion: "excited" as EmotionType,
     usedTool: false
   }],
@@ -259,7 +259,7 @@ export interface ChatResponse {
 
 /**
  * Remove all emojis, alphabet characters, XML tags, and technical characters from text
- * TTS reads Japanese only - technical characters cause bad pronunciation
+ * TTS reads English - strip emojis and technical markup but keep letters
  */
 function removeExcessiveEmojis(text: string): string {
   // Remove any [EMOTION:xxx] tags that might appear in middle of text
@@ -279,7 +279,7 @@ function removeExcessiveEmojis(text: string): string {
   const emojiRegex = /[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu;
 
   // Remove phrases that shouldn't be spoken
-  const phrasesToRemove = ["search_moviesツール"];
+  const phrasesToRemove = ["search_movies tool"];
   for (const phrase of phrasesToRemove) {
     text = text.replace(phrase, '');
   }
@@ -287,15 +287,11 @@ function removeExcessiveEmojis(text: string): string {
   // Remove ALL emojis from the text
   text = text.replace(emojiRegex, '');
 
-  // Remove alphabet characters (a-z, A-Z) - TTS can't read romaji well
-  // Keep: hiragana, katakana, kanji, punctuation, numbers
-  text = text.replace(/[a-zA-Z]+/g, '');
-
   // Remove any leftover brackets from emotion tags
   text = text.replace(/\[\s*:\s*\]/g, '');
   text = text.replace(/\[\s*\]/g, '');
 
-  // Remove other technical characters that TTS can't read
+  // Remove other technical characters that TTS can't read well
   text = text.replace(/[<>_`*#~|]/g, '');
 
   // Clean up extra spaces and trim
@@ -314,13 +310,14 @@ function trimToCompleteSentence(text: string): string {
   if (text.length === 0) return text;
 
   // Already ends with a sentence marker — nothing to trim
-  if (/[。！？!?]$/.test(text)) return text;
+  if (/[。！？.!?]$/.test(text)) return text;
 
   // Find the last sentence-ending character
   const lastEnd = Math.max(
     text.lastIndexOf('。'),
     text.lastIndexOf('！'),
     text.lastIndexOf('？'),
+    text.lastIndexOf('.'),
     text.lastIndexOf('!'),
     text.lastIndexOf('?'),
   );

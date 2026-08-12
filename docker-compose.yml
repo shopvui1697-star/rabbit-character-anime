@@ -54,11 +54,10 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
-      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gourmet-search-place-tts.json
+      NINEROUTER_URL: http://host.docker.internal:20128
     ports:
       - "3001:3001"
     volumes:
-      - ./backend/gourmet-search-place-tts.json:/run/secrets/gourmet-search-place-tts.json:ro
       - ./backend/logs:/app/backend/logs
     depends_on:
       postgres:

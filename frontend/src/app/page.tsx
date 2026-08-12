@@ -23,9 +23,9 @@ const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:3001/ws";
 
 // Google STT Configuration
 // Audio is streamed via backend WebSocket to Google Cloud Speech-to-Text
-// Japanese (ja-JP) optimized for best speech recognition accuracy
+// English (en-US) speech recognition
 const GOOGLE_STT_CONFIG = {
-  languageCode: "ja-JP",
+  languageCode: "en-US",
   sampleRate: 16000,
 };
 
@@ -546,9 +546,9 @@ export default function Home() {
   }, [audioPlayer.isPlaying, wsStatus]);
 
   const displayStatusText = useMemo(() => {
-    if (audioPlayer.isPlaying) return "話しています...";
+    if (audioPlayer.isPlaying) return "Speaking...";
     // Backend may send "speaking" status text before audio starts; show thinking text instead
-    if (wsStatus === "speaking") return "考え中...";
+    if (wsStatus === "speaking") return "Thinking...";
     return statusText;
   }, [audioPlayer.isPlaying, wsStatus, statusText]);
 
@@ -556,7 +556,7 @@ export default function Home() {
     <div className={styles.container}>
       <header className={styles.header}>
         <h1 className={styles.title}>Lovvit Archive</h1>
-        <p className={styles.subtitle}>日本語会話AIアシスタント</p>
+        <p className={styles.subtitle}>English conversational AI assistant</p>
       </header>
 
       <main className={styles.main}>
@@ -572,7 +572,7 @@ export default function Home() {
           {audioPlayer.isPlaying && (
             <div className={styles.audioIndicator}>
               <span className={styles.audioWave}>🔊</span>
-              <span>音声再生中...</span>
+              <span>Playing audio...</span>
             </div>
           )}
 
@@ -604,13 +604,13 @@ export default function Home() {
                   className={`${styles.focusBtn} ${styles.focusBtnSave}`}
                   onClick={() => handleCardSelect(focusedItem.index, focusedItem.itemId, "save")}
                 >
-                  保存
+                  Save
                 </button>
                 <button
                   className={`${styles.focusBtn} ${styles.focusBtnDetail}`}
                   onClick={() => handleCardSelect(focusedItem.index, focusedItem.itemId, "detail")}
                 >
-                  詳細
+                  Details
                 </button>
               </div>
             </div>

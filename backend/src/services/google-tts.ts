@@ -55,14 +55,14 @@ function getClient(): TextToSpeechClient {
   return ttsClient;
 }
 
-// Voice mapping for Japanese
+// Voice mapping for English
 const GOOGLE_VOICES = {
   female: {
-    name: 'ja-JP-Neural2-B', // Natural, female voice
+    name: config.google.ttsVoice || 'en-US-Neural2-F',
     ssmlGender: 'FEMALE' as const,
   },
   male: {
-    name: 'ja-JP-Neural2-C', // Natural, male voice
+    name: 'en-US-Neural2-D',
     ssmlGender: 'MALE' as const,
   },
 } as const;
@@ -108,7 +108,7 @@ export async function synthesizeSpeech(
   const request = {
     input: { text },
     voice: {
-      languageCode: 'ja-JP',
+      languageCode: 'en-US',
       name: voiceConfig.name,
       ssmlGender: voiceConfig.ssmlGender,
     },
@@ -157,7 +157,7 @@ export async function listVoices(): Promise<any[]> {
   try {
     const client = getClient();
     const [response] = await client.listVoices({
-      languageCode: 'ja-JP',
+      languageCode: 'en-US',
     });
     return response.voices || [];
   } catch (error) {
@@ -172,7 +172,7 @@ export async function listVoices(): Promise<any[]> {
 export async function testTTS(): Promise<boolean> {
   try {
     log.info('Testing Google TTS...');
-    const audio = await synthesizeSpeech('こんにちは', {
+    const audio = await synthesizeSpeech('Hello', {
       voice: 'female',
       emotion: 'neutral',
     });

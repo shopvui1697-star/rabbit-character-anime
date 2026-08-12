@@ -74,8 +74,8 @@ export const SearchResultsPanel = memo(function SearchResultsPanel({
       <div className={styles.container}>
         <div className={styles.empty}>
           <div className={styles.emptyIcon}>🔍</div>
-          <p className={styles.emptyText}>検索結果がここに表示されます</p>
-          <p className={styles.emptySubtext}>映画やグルメを検索してみてください</p>
+          <p className={styles.emptyText}>Search results will appear here</p>
+          <p className={styles.emptySubtext}>Try searching for movies or restaurants</p>
         </div>
       </div>
     );
@@ -96,9 +96,9 @@ export const SearchResultsPanel = memo(function SearchResultsPanel({
       {/* Results header */}
       <div className={styles.resultsHeader}>
         <h3 className={styles.resultsTitle}>
-          {searchResults.type === "movie" ? "🎬 検索結果" : "🍽️ 検索結果"}
+          {searchResults.type === "movie" ? "🎬 Search Results" : "🍽️ Search Results"}
         </h3>
-        <span className={styles.resultsCount}>{searchResults.total}件</span>
+        <span className={styles.resultsCount}>{searchResults.total} results</span>
       </div>
       
       {/* Results grid */}
@@ -133,7 +133,7 @@ export const SearchResultsPanel = memo(function SearchResultsPanel({
               onClick={() => handleCardClick(index, itemId)}
               role="button"
               tabIndex={0}
-              aria-label={`${index + 1}番目の検索結果: ${movie.title_ja}`}
+              aria-label={`Search result ${index + 1}: ${movie.title_ja}`}
               aria-selected={isSelected}
             >
               {/* Number badge */}
@@ -189,7 +189,7 @@ export const SearchResultsPanel = memo(function SearchResultsPanel({
               onClick={() => handleCardClick(index, itemId)}
               role="button"
               tabIndex={0}
-              aria-label={`${index + 1}番目の検索結果: ${restaurant.name}`}
+              aria-label={`Search result ${index + 1}: ${restaurant.name}`}
               aria-selected={isSelected}
             >
               {/* Number badge */}

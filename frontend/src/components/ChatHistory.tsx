@@ -14,7 +14,7 @@ interface ChatHistoryProps {
 }
 
 function formatTime(date: Date): string {
-  return date.toLocaleTimeString("ja-JP", {
+  return date.toLocaleTimeString("en-US", {
     hour: "2-digit",
     minute: "2-digit",
   });
@@ -56,7 +56,7 @@ const MessageItem = memo(
         >
           <div className={styles.bubble}>
             <span className={styles.content}>
-              {content || (searchResults.type === "movie" ? "🎬 映画の検索結果があります →" : "🍽️ グルメの検索結果があります →")}
+              {content || (searchResults.type === "movie" ? "🎬 Movie search results available →" : "🍽️ Restaurant search results available →")}
             </span>
           </div>
           <div className={styles.timestamp}>{formatTime(timestamp)}</div>
@@ -77,7 +77,7 @@ const MessageItem = memo(
             <button
               className={styles.saveButton}
               onClick={onSave}
-              title={isSaved ? "保存済み" : "アーカイブに保存"}
+              title={isSaved ? "Saved" : "Save to archive"}
               disabled={isSaved}
             >
               {isSaved ? "✓" : "📚"}
@@ -198,7 +198,7 @@ export function ChatHistory({ messages, userId, onSaveToArchive, textOnly = fals
     return (
       <div className={styles.container}>
         <div className={styles.empty}>
-          会話を開始してください...
+          Start a conversation...
         </div>
       </div>
     );
