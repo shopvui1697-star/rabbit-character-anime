@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: rabbit-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rabbit_movies
+    ports:
+      - "5432:5432"
+    volumes:
+      - rabbit_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rabbit_movies"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  db-init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: rabbit-db-init
+    env_file:
+      - backend/.env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: rabbit_movies
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+    command: ["node", "dist/db/setup.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: rabbit-backend
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    environment:
+      PORT: 3001
+      CORS_ORIGIN: http://localhost:3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: rabbit_movies
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gourmet-search-place-tts.json
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend/gourmet-search-place-tts.json:/run/secrets/gourmet-search-place-tts.json:ro
+      - ./backend/logs:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:3001
+        NEXT_PUBLIC_WS_URL: ws://localhost:3001/ws
+        NEXT_PUBLIC_DEBUG: "true"
+    container_name: rabbit-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  rabbit_postgres_data:
