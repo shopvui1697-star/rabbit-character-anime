@@ -33,6 +33,15 @@ const DEFAULT_INTERIM_STABILITY_MS = parseInt(
 const VAD_CONFIRM_MS = parseInt(process.env.NEXT_PUBLIC_VAD_CONFIRM_MS || "200", 10);
 const VAD_RELEASE_MS = parseInt(process.env.NEXT_PUBLIC_VAD_RELEASE_MS || "200", 10);
 
+// Adaptive noise-floor threshold: RMS_SPEECH_THRESHOLD above is now a MINIMUM floor,
+// not the sole cutoff. During confirmed non-speech we track an EMA of the room's noise
+// level, and require RMS to clear (noise floor * multiplier) to count as speech — this
+// tracks the mic input AFTER echo cancellation (see AudioCaptureManager), so residual
+// echo that leaks through also gets absorbed into "ambient noise" rather than
+// repeatedly tripping VAD at a fixed threshold that has to be hand-tuned per environment.
+const VAD_NOISE_FLOOR_ALPHA = parseFloat(process.env.NEXT_PUBLIC_VAD_NOISE_FLOOR_ALPHA || "0.05");
+const VAD_ADAPTIVE_MULTIPLIER = parseFloat(process.env.NEXT_PUBLIC_VAD_ADAPTIVE_MULTIPLIER || "3.0");
+
 /**
  * Global STT Instance Manager
  * Ensures only one STT session is active at a time
@@ -92,6 +101,13 @@ export interface UseGoogleSTTOptions {
    * authoritative in the exclusive-fallback path (routed through `onTranscript`).
    */
   onFastSignal?: (text: string, isFinal: boolean) => void;
+  /**
+   * Acoustic echo coupling strength (0..1), reported by the NLMS echo canceller
+   * roughly 2x/sec while it has a confident delay lock. High values mean strong
+   * speaker→mic coupling (e.g. laptop built-in speaker); near-zero means little
+   * to no coupling (e.g. headphones — nothing to echo-cancel or duck against).
+   */
+  onEchoCoupling?: (strength: number) => void;
   // Auto-stop configuration
   inactivityTimeout?: number;     // ms of silence before auto-stop (0 = disabled, default: 0)
   stopOnTabHidden?: boolean;      // Stop when tab hidden (default: true)
@@ -135,6 +151,7 @@ export function useGoogleSTT({
   onStop,
   onVoiceActivity,
   onFastSignal,
+  onEchoCoupling,
   inactivityTimeout = 0,        // Disabled by default — user clicks mic to stop
   stopOnTabHidden = true,
   interimStabilityMs = DEFAULT_INTERIM_STABILITY_MS,
@@ -161,6 +178,7 @@ export function useGoogleSTT({
   const onStopRef = useRef(onStop);
   const onVoiceActivityRef = useRef(onVoiceActivity);
   const onFastSignalRef = useRef(onFastSignal);
+  const onEchoCouplingRef = useRef(onEchoCoupling);
 
   // Interim stability detection refs
   const stabilityTimer = useRef<NodeJS.Timeout | null>(null);
@@ -172,6 +190,11 @@ export function useGoogleSTT({
   const vadActiveRef = useRef(false);
   const vadAboveSinceRef = useRef(0);
   const vadBelowSinceRef = useRef(0);
+
+  // Adaptive VAD noise floor — EMA of RMS during confirmed non-speech (see
+  // VAD_NOISE_FLOOR_ALPHA / VAD_ADAPTIVE_MULTIPLIER above). Seeded at the
+  // configured minimum floor so it starts sane before any silence is observed.
+  const noiseFloorRef = useRef(RMS_SPEECH_THRESHOLD);
 
   const emitTranscript = useCallback((text: string, isFinal: boolean) => {
     const cleaned = sanitizeTranscript(text, isFinal, hadSpeechEnergyRef.current);
@@ -201,7 +224,8 @@ export function useGoogleSTT({
     onStopRef.current = onStop;
     onVoiceActivityRef.current = onVoiceActivity;
     onFastSignalRef.current = onFastSignal;
-  }, [onTranscript, onError, onStart, onStop, onVoiceActivity, onFastSignal]);
+    onEchoCouplingRef.current = onEchoCoupling;
+  }, [onTranscript, onError, onStart, onStop, onVoiceActivity, onFastSignal, onEchoCoupling]);
 
   // Web Speech transcript: authoritative in "fallback" mode (routed to onTranscript,
   // same as before), fast-signal-only in "assist" mode (routed to onFastSignal instead).
@@ -531,6 +555,7 @@ export function useGoogleSTT({
       vadActiveRef.current = false;
       vadAboveSinceRef.current = 0;
       vadBelowSinceRef.current = 0;
+      noiseFloorRef.current = RMS_SPEECH_THRESHOLD;
       clearStabilityTimer();
 
       // Tell backend to start STT stream
@@ -548,17 +573,26 @@ export function useGoogleSTT({
       });
 
       // Start audio capture - send chunks to backend via WebSocket (VAD-gated)
-      await audioCapture.current.start((audioData: Uint8Array, rms: number) => {
+      await audioCapture.current.start((audioData: Uint8Array, rms: number, couplingStrength: number) => {
         try {
+          onEchoCouplingRef.current?.(couplingStrength);
+
           if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !isListeningRef.current) {
             return;
           }
 
           const now = Date.now();
-          const isSpeech = rms >= RMS_SPEECH_THRESHOLD;
+          // Adaptive threshold: RMS must clear the noise floor by a margin, with
+          // RMS_SPEECH_THRESHOLD as an absolute minimum (never trigger on near-silence
+          // even if the tracked floor has drifted close to zero in a very quiet room).
+          const adaptiveThreshold = Math.max(RMS_SPEECH_THRESHOLD, noiseFloorRef.current * VAD_ADAPTIVE_MULTIPLIER);
+          const isSpeech = rms >= adaptiveThreshold;
           if (isSpeech) {
             lastSpeechChunkMs.current = now;
             hadSpeechEnergyRef.current = true;
+          } else {
+            // Only track the floor during confirmed non-speech, post-echo-cancellation RMS.
+            noiseFloorRef.current = noiseFloorRef.current * (1 - VAD_NOISE_FLOOR_ALPHA) + rms * VAD_NOISE_FLOOR_ALPHA;
           }
 
           // Fast VAD signal (duration-guarded): confirms/releases on sustained

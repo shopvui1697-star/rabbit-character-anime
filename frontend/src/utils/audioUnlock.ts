@@ -13,6 +13,31 @@ let isUnlocked = false;
 const waitingBufferCache = new Map<number, AudioBuffer>();
 
 /**
+ * Subscribers receive the raw mono samples of TTS audio the instant it starts
+ * playing — used as the "known reference signal" for acoustic echo cancellation
+ * (see AudioCaptureManager in audioUtils.ts). Callbacks fire synchronously from
+ * inside `source.start(0)`, so subscribers can stamp their own AudioContext's
+ * `currentTime` at that exact instant to align the reference on their own clock.
+ */
+type PlaybackReferenceListener = (samples: Float32Array, sampleRate: number) => void;
+const referenceListeners = new Set<PlaybackReferenceListener>();
+
+/** Subscribe to raw TTS playback audio for echo-cancellation reference. Returns an unsubscribe fn. */
+export function onPlaybackReference(listener: PlaybackReferenceListener): () => void {
+  referenceListeners.add(listener);
+  return () => referenceListeners.delete(listener);
+}
+
+function publishPlaybackReference(buffer: AudioBuffer): void {
+  if (referenceListeners.size === 0) return;
+  // Mono reference is enough for echo cancellation — first channel only.
+  const samples = buffer.getChannelData(0);
+  for (const listener of referenceListeners) {
+    listener(samples, buffer.sampleRate);
+  }
+}
+
+/**
  * Get or create the shared AudioContext.
  * All audio playback should go through this single context.
  */
@@ -133,6 +158,7 @@ export async function playAudioFromBase64(
     source.buffer = audioBuffer;
     source.connect(gainNode);
     source.start(0);
+    publishPlaybackReference(audioBuffer);
 
     log.debug(`Playing audio: ${audioBuffer.duration.toFixed(2)}s`);
 
@@ -164,6 +190,7 @@ export function playAudioBuffer(
   source.buffer = buffer;
   source.connect(gainNode);
   source.start(0);
+  publishPlaybackReference(buffer);
 
   return { source, duration: buffer.duration };
 }

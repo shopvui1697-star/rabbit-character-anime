@@ -216,6 +216,16 @@ NEXT_PUBLIC_VAD_CONFIRM_MS=200            # RMS liên tục vượt ngưỡng ba
 NEXT_PUBLIC_VAD_RELEASE_MS=200            # RMS liên tục dưới ngưỡng bao lâu mới coi là "hết nói"
 NEXT_PUBLIC_TTS_VAD_DUCK_VOLUME=0.08      # mức duck sâu khi VAD xác nhận có giọng nói
 NEXT_PUBLIC_TTS_DUCK_VOLUME=0.25          # mức duck ambient khi mic đang listen (không cần VAD)
+
+# VAD ngưỡng thích ứng theo noise floor — xem §7.1.C.v2
+NEXT_PUBLIC_VAD_NOISE_FLOOR_ALPHA=0.05    # tốc độ EMA theo dõi noise floor
+NEXT_PUBLIC_VAD_ADAPTIVE_MULTIPLIER=3.0   # ngưỡng nói = noise floor * hệ số này
+
+# AEC — NLMS echo canceller thật — xem §7.1.A.v2
+NEXT_PUBLIC_AEC_ENABLED=true
+NEXT_PUBLIC_AEC_TAP_COUNT=512             # số tap filter (~10-15ms @ 48kHz)
+NEXT_PUBLIC_AEC_STEP_SIZE=0.3             # tốc độ học NLMS (mu)
+NEXT_PUBLIC_AEC_MAX_DELAY_MS=250          # phạm vi tìm delay loa→mic
 ```
 
 ### Bảng khuyến nghị theo ngôn ngữ
@@ -250,13 +260,14 @@ Nếu thiếu/sai credential → frontend **tự động fallback** sang Web Spe
 
 | File | Vai trò |
 |------|---------|
-| `frontend/src/app/page.tsx` | Early + regular barge-in, gọi `sendMessage()`; duck TTS theo `voiceActive` (VAD) |
+| `frontend/src/app/page.tsx` | Early + regular barge-in, gọi `sendMessage()`; duck TTS nội suy theo `voiceActive` + `echoCouplingRef` (§A.v2) |
 | `frontend/src/hooks/useAudioPlayer.ts` | `cancelAllAudio()`, quản lý responseId |
 | `frontend/src/hooks/useWaitingPhrase.ts` | `stopWaitingPhrase()` khi barge-in |
-| `frontend/src/hooks/useGoogleSTT.ts` | **Tên legacy** — orchestrate STT: backend stream + Web Speech (fallback **và** assist); ✅ fast VAD duration-guard (`onVoiceActivity`), ✅ `webSpeechModeRef`/`onFastSignal` (parallel assist) |
-| `frontend/src/hooks/useWebSpeechFallback.ts` | Browser native STT — dùng ở 2 mode (fallback authoritative / assist fast-signal), không có tín hiệu VAD (không truy cập raw audio) |
-| `frontend/src/utils/audioUtils.ts` | `AudioCaptureManager` — AEC/`echoCancellation` qua `getUserMedia`, tính RMS mỗi ~100ms |
-| `frontend/src/utils/audioUnlock.ts` | `duckSharedVolume()`/`restoreSharedVolume()` — GainNode dùng cho duck ambient + duck sâu VAD |
+| `frontend/src/hooks/useGoogleSTT.ts` | **Tên legacy** — orchestrate STT: backend stream + Web Speech (fallback **và** assist); ✅ VAD duration-guard + ngưỡng thích ứng (`onVoiceActivity`, §C.v2), ✅ `webSpeechModeRef`/`onFastSignal` (parallel assist), ✅ `onEchoCoupling` (§A.v2) |
+| `frontend/src/hooks/useWebSpeechFallback.ts` | Browser native STT — dùng ở 2 mode (fallback authoritative / assist fast-signal), không có tín hiệu VAD/AEC (không truy cập raw audio) |
+| `frontend/src/utils/audioUtils.ts` | `AudioCaptureManager` — AEC browser (`echoCancellation`) qua `getUserMedia`; ✅ subscribe reference bus, forward vào worklet qua `processorOptions`/`postMessage`, đọc `couplingStrength` |
+| `frontend/public/audio-processor.worklet.js` | ✅ **`EchoCanceller`** — NLMS adaptive filter thật, delay search, ring buffer reference real-time (§A.v2); RMS/PCM gửi ra đã qua echo cancellation |
+| `frontend/src/utils/audioUnlock.ts` | `duckSharedVolume()`/`restoreSharedVolume()`; ✅ `onPlaybackReference()` — publish PCM TTS làm reference signal cho AEC (§A.v2) |
 | `frontend/src/components/ChatInput.tsx` | UI placeholder "talk to interrupt" |
 | `backend/src/websocket/handler.ts` | `stt_start`/`stt_audio`, `currentResponseId`, hủy response cũ; ✅ `Session.currentAbortController` — abort thật LLM call khi barge-in |
 | `backend/src/services/claude.ts` | `chat()` nhận `signal?: AbortSignal`, truyền xuống mọi lời gọi `invokeLLM`/`invokeLLMStream` |
@@ -318,6 +329,27 @@ Ngoài ra, `page.tsx` đã duck TTS volume xuống `TTS_DUCK_VOLUME` (0.25) bấ
 
 **Còn thiếu (chưa triển khai):** AEC3-class tuyến tính thật (linear adaptive filter theo research §9.1) — không khả thi thuần browser mà không dùng WebRTC PeerConnection loopback; cooldown period sau khi TTS bắt đầu đã có sẵn ở `bargeInGuard.ts` (`BARGE_IN_COOLDOWN_MS`, mặc định 600ms) từ trước, không phải đề xuất mới.
 
+##### A.v2 — NLMS echo canceller thật (2026-08-13, level-up theo yêu cầu)
+
+**Vấn đề còn lại của v1:** AEC vẫn hoàn toàn là "hộp đen" của browser — không biết browser có thực sự cancel tốt audio phát qua Web Audio API (không qua `<audio>`/`<video>` element) hay không, và Web Speech fallback path không có AEC nào cả (Web Speech tự quản lý mic nội bộ, code không có quyền set constraint).
+
+**Đã làm:** Một bộ triệt echo **NLMS (Normalized Least-Mean-Squares)** thật, chạy trong `audio-processor.worklet.js`, độc lập với cờ `echoCancellation` của browser:
+
+- **Reference signal chính xác**: `audioUnlock.ts` publish thẳng PCM thô của audio TTS ngay khi `source.start(0)` được gọi (`onPlaybackReference` pub/sub). `AudioCaptureManager` subscribe, resample về sample rate của AudioContext capture (dùng lại `resampleAudio` có sẵn), forward vào worklet qua `postMessage`.
+- **Đồng bộ 2 AudioContext độc lập** (playback context và capture context không chia sẻ đồng hồ): thời điểm publish, subscriber đọc `currentTime` của CHÍNH capture context (không phải playback context) — vì callback chạy đồng bộ ngay trong `source.start(0)`, "now" ở 2 context là cùng một khoảnh khắc thực. Worklet dùng timestamp này để nhỏ giọt ("ingest") từng phần reference vào ring buffer đúng theo tiến độ audio *thực sự đang phát*, không phải "đã được queue" — quan trọng vì 1 chunk TTS có thể dài vài giây nhưng phát trải dài theo thời gian thực.
+- **Delay estimation**: cross-correlation thô (bước 3 sample) giữa mic gần nhất và reference trong cửa sổ tìm kiếm `NEXT_PUBLIC_AEC_MAX_DELAY_MS` (250ms), chạy lại ~2 lần/giây, có **hysteresis** (chỉ chấp nhận delay mới nếu lệch >5ms so với delay hiện tại) để tránh reset filter liên tục do nhiễu đo đạc.
+- **NLMS filter** (`NEXT_PUBLIC_AEC_TAP_COUNT`=512 tap ≈10-15ms tại 48kHz, mô hình hóa đường truyền âm trực tiếp loa→mic — không phải reverb cả phòng): dự đoán echo từ reference đã align theo delay, trừ khỏi mic **trước khi** tính RMS và **trước khi** gửi PCM lên Whisper — cả VAD và STT đều hưởng lợi từ audio đã sạch hơn.
+- **Silence gate**: có 1 bug thật đã tìm và fix trong quá trình build — chia `gain = mu*error/energy` khi `energy` (năng lượng reference) tiến về 0 (lúc AI ngừng nói giữa câu) làm gain nổ, phá hỏng weight ngay lúc đó. Fix bằng cách theo dõi `avgEnergy` (EMA) và **bỏ qua update** khi `energy < avgEnergy * 5%`.
+- Kết quả `couplingStrength` (0..1, độ tin cậy correlation tại delay ước lượng) được báo lên `useGoogleSTT` → `page.tsx` qua `onEchoCoupling`, dùng để **nội suy mức duck động** thay 2 mức cố định — coupling mạnh (loa+mic cùng máy) → duck sâu như cũ; coupling ~0 (headphone, không có đường echo vật lý) → gần như không duck, giữ độ tự nhiên/nhanh nhạy.
+
+**Đã verify bằng simulation (Node, không phải browser thật)**: mock `AudioWorkletGlobalScope`, tạo tín hiệu tham chiếu dạng "giống giọng nói" (noise đã lọc + envelope chậm) + echo có delay/gain biết trước, chạy qua toàn bộ pipeline ingest→delay-search→NLMS. Kết quả: delay ước lượng đúng ±0ms ở 15/60/100/200ms test, ERLE (Echo Return Loss Enhancement) ổn định ~3.5-3.9dB sau hội tụ (giảm ~55-60% năng lượng echo), không NaN/instability qua nhiều lần chạy.
+
+**Hạn chế đã biết:**
+- Đây là filter **direct-path ngắn** (~10-15ms), không phải AEC3-class full room-reverb canceller (AEC3 dùng partitioned FFT block, filter 100-300ms) — đủ cho coupling trực tiếp loa↔mic laptop/phone, không cancel được phản xạ phòng phức tạp.
+- ERLE ~3.5-4dB là mức khiêm tốn (chưa test với audio giọng nói thật, chỉ synthetic) — cần test thật với mic+loa để biết hiệu quả thực tế; có thể cần tinh chỉnh `NEXT_PUBLIC_AEC_STEP_SIZE`/`NEXT_PUBLIC_AEC_TAP_COUNT` theo thiết bị thật.
+- Vẫn không có trên path Web Speech fallback (không truy cập raw audio).
+- Chưa test trên thiết bị di động (CPU yếu hơn) — 512 tap × ~48000 sample/s × 2 loop (predict+update) có thể cần giảm tap count trên máy yếu; đã để config qua env để dễ chỉnh (`NEXT_PUBLIC_AEC_ENABLED=false` để tắt hoàn toàn nếu gây vấn đề).
+
 #### B. AbortController cho LLM streaming — ✅ Đã triển khai (2026-08-13)
 
 **Vấn đề:** Response cũ vẫn tiêu tốn token dù đã cancelled.
@@ -338,6 +370,14 @@ Ngoài ra, `page.tsx` đã duck TTS volume xuống `TTS_DUCK_VOLUME` (0.25) bấ
 **Giới hạn đã biết:** Chỉ hoạt động trên path Primary (NineRouter/Groq, có raw audio qua `AudioCaptureManager`) — path Fallback (Web Speech API) không expose raw audio nên không có tín hiệu VAD này (không regression, giữ hành vi cũ). Chưa dùng Silero/neural VAD (không cần thiết — energy-based đã đủ theo research §9.1, tránh thêm dependency ~2MB WASM).
 
 Việc giảm `NINEROUTER_STT_INTERVAL_MS` (trade-off tăng API calls/cost) vẫn là đề xuất mở, chưa áp dụng.
+
+##### C.v2 — Ngưỡng thích ứng theo noise floor (2026-08-13, level-up theo yêu cầu)
+
+**Vấn đề còn lại của v1:** `NEXT_PUBLIC_STT_RMS_THRESHOLD` là hằng số cố định (0.012) — môi trường ồn hơn/yên tĩnh hơn phải chỉnh tay, và không tự thích ứng khi điều kiện thay đổi giữa buổi nói chuyện.
+
+**Đã làm:** `useGoogleSTT.ts` theo dõi `noiseFloorRef` — EMA (`NEXT_PUBLIC_VAD_NOISE_FLOOR_ALPHA`=0.05) của RMS, **chỉ cập nhật khi đang ở trạng thái im lặng đã xác nhận** (tránh noise floor bị kéo lên bởi chính giọng nói). Ngưỡng nói thật giờ là `max(RMS_SPEECH_THRESHOLD, noiseFloor * NEXT_PUBLIC_VAD_ADAPTIVE_MULTIPLIER)` — `RMS_SPEECH_THRESHOLD` cũ trở thành **sàn tối thiểu tuyệt đối** (không bao giờ trigger dù phòng yên tĩnh tới mức noise floor gần 0), còn ngưỡng thực tế tự nâng lên khi môi trường ồn hơn.
+
+Quan trọng: RMS đưa vào adaptive threshold này là RMS **sau khi đã qua NLMS echo cancellation** (§A.v2) — nên echo còn sót lại (nếu AEC chưa cancel hết) cũng bị "hấp thụ" vào noise floor thay vì liên tục trigger VAD sai.
 
 #### C2. Rename hook + làm rõ STT mode trong UI
 
@@ -595,15 +635,15 @@ if (vadPositive && Date.now() - vadPositiveStartRef.current >= VAD_CONFIRM_MS) {
 
 ## 10. Tóm tắt
 
-Barge-in là tính năng **core UX** của Rabbit AI Avatar, cho phép hội thoại giọng nói tự nhiên. Sau bản cập nhật 2026-08-13 (VAD, AEC xác nhận, LLM abort, Web Speech assist), kiến trúc **mạnh ở cả frontend và backend**; còn thiếu chủ yếu là **intent-aware filtering** (filler/backchannel) và AEC3-class tuyến tính thật.
+Barge-in là tính năng **core UX** của Rabbit AI Avatar, cho phép hội thoại giọng nói tự nhiên. Sau 2 bản cập nhật 2026-08-13 (VAD/AEC cơ bản → LLM abort/Web Speech assist → **NLMS echo canceller thật + VAD ngưỡng thích ứng**), kiến trúc **mạnh ở cả frontend và backend**; còn thiếu chủ yếu là **intent-aware filtering** (filler/backchannel) và test thực tế trên thiết bị (AEC mới chỉ verify bằng simulation, chưa test với mic+loa thật).
 
 | Khía cạnh | Đánh giá |
 |-----------|----------|
 | Tốc độ phản hồi | ⭐⭐⭐⭐⭐ (VAD duck ~200ms + Web Speech assist, trước cả NineRouter interim) |
-| Độ tin cậy | ⭐⭐⭐⭐ (browser AEC + VAD duck giảm risk; vẫn thiếu filler-filtering) |
-| Kiến trúc | ⭐⭐⭐⭐ (responseId pattern rõ ràng, mode-branching Web Speech tường minh) |
+| Độ tin cậy | ⭐⭐⭐⭐ (NLMS AEC thật + VAD thích ứng theo noise floor; chưa test thiết bị thật, thiếu filler-filtering) |
+| Kiến trúc | ⭐⭐⭐⭐⭐ (responseId pattern, mode-branching Web Speech, reference-signal AEC pipeline tường minh) |
 | Cost efficiency | ⭐⭐⭐⭐ (LLM abort thật qua AbortController, cả Anthropic & Bedrock) |
-| UX | ⭐⭐⭐⭐ (continuous mic, placeholder hint, mic-pulse phản hồi nhanh hơn) |
+| UX | ⭐⭐⭐⭐ (continuous mic, placeholder hint, mic-pulse phản hồi nhanh hơn, duck thích ứng theo coupling) |
 
 ---
 

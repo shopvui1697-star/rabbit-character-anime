@@ -5,6 +5,7 @@
  */
 
 import { createLogger } from "@/utils/logger";
+import { onPlaybackReference } from "@/utils/audioUnlock";
 
 const log = createLogger("AudioUtils");
 
@@ -139,6 +140,21 @@ export const DEFAULT_AUDIO_CONFIG: AudioCaptureConfig = {
 export const ENABLE_RNNOISE = false; // Changed to false for better Japanese recognition
 
 /**
+ * Reference-signal acoustic echo cancellation (NLMS adaptive filter, runs inside
+ * the AudioWorklet — see audio-processor.worklet.js). Independent of the browser's
+ * own `echoCancellation` constraint above: this one has an exact known reference
+ * (the TTS PCM as it plays) rather than relying on the browser's own, possibly
+ * limited, visibility into Web-Audio-API-based playback.
+ */
+export const AEC_CONFIG = {
+  enabled: (process.env.NEXT_PUBLIC_AEC_ENABLED ?? "true") === "true",
+  tapCount: parseInt(process.env.NEXT_PUBLIC_AEC_TAP_COUNT || "512", 10),
+  stepSize: parseFloat(process.env.NEXT_PUBLIC_AEC_STEP_SIZE || "0.3"),
+  maxDelayMs: parseFloat(process.env.NEXT_PUBLIC_AEC_MAX_DELAY_MS || "250"),
+  refBufferSeconds: 3,
+};
+
+/**
  * Audio capture manager using Web Audio API
  * Uses modern AudioWorkletNode instead of deprecated ScriptProcessorNode
  * Integrates RNNoise for superior noise suppression
@@ -150,15 +166,16 @@ export class AudioCaptureManager {
   private processorNode: AudioWorkletNode | null = null;
   private silentGainNode: GainNode | null = null;
   private rnnoiseNode: AudioWorkletNode | null = null;
-  private onAudioData: ((data: Uint8Array, rms: number) => void) | null = null;
+  private onAudioData: ((data: Uint8Array, rms: number, couplingStrength: number) => void) | null = null;
   private config: AudioCaptureConfig;
   private useRNNoise: boolean = ENABLE_RNNOISE; // Use global toggle
+  private unsubscribeReference: (() => void) | null = null;
 
   constructor(config: Partial<AudioCaptureConfig> = {}) {
     this.config = { ...DEFAULT_AUDIO_CONFIG, ...config };
   }
 
-  async start(onAudioData: (data: Uint8Array, rms: number) => void): Promise<void> {
+  async start(onAudioData: (data: Uint8Array, rms: number, couplingStrength: number) => void): Promise<void> {
     this.onAudioData = onAudioData;
 
     // Request microphone access
@@ -198,20 +215,42 @@ export class AudioCaptureManager {
       throw new Error("AudioWorklet not supported or failed to load");
     }
 
-    // Create AudioWorklet node for audio processing
-    this.processorNode = new AudioWorkletNode(this.audioContext, 'audio-capture-processor');
-    
+    // Create AudioWorklet node for audio processing. AEC tuning (tap count, max
+    // delay) is passed via processorOptions since it determines buffer sizes
+    // allocated once at construction — see audio-processor.worklet.js.
+    this.processorNode = new AudioWorkletNode(this.audioContext, 'audio-capture-processor', {
+      processorOptions: { aec: AEC_CONFIG },
+    });
+
     // Set sample rate
     this.processorNode.port.postMessage({
       type: 'setSampleRate',
       sampleRate: this.config.sampleRate,
     });
 
+    // Relay TTS playback audio to the worklet as the AEC reference signal.
+    // Timestamp with THIS (capture) AudioContext's currentTime, read synchronously
+    // right here — the listener fires synchronously from inside `source.start(0)`
+    // on the playback side, so "now" on both contexts' clocks is the same instant.
+    this.unsubscribeReference = onPlaybackReference((samples, refSampleRate) => {
+      if (!AEC_CONFIG.enabled || !this.processorNode || !this.audioContext) return;
+      const startTime = this.audioContext.currentTime;
+      const resampled =
+        refSampleRate === this.audioContext.sampleRate
+          ? new Float32Array(samples) // copy — postMessage transfer takes ownership
+          : resampleAudio(samples, refSampleRate, this.audioContext.sampleRate);
+      this.processorNode.port.postMessage(
+        { type: 'referenceAudio', data: resampled, startTime },
+        [resampled.buffer]
+      );
+    });
+
     // Handle audio data from worklet
     this.processorNode.port.onmessage = (event) => {
       if (event.data.type === 'audioData') {
         const rms = typeof event.data.rms === 'number' ? event.data.rms : 0;
-        this.onAudioData?.(event.data.data, rms);
+        const couplingStrength = typeof event.data.couplingStrength === 'number' ? event.data.couplingStrength : 0;
+        this.onAudioData?.(event.data.data, rms, couplingStrength);
       }
     };
 
@@ -290,6 +329,11 @@ export class AudioCaptureManager {
   }
 
   stop(): void {
+    if (this.unsubscribeReference) {
+      this.unsubscribeReference();
+      this.unsubscribeReference = null;
+    }
+
     if (this.processorNode) {
       this.processorNode.port.onmessage = null;
       this.processorNode.disconnect();

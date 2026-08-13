@@ -119,6 +119,8 @@ export default function Home() {
   const [voiceDetected, setVoiceDetected] = useState(false);
   // Fast VAD signal (duration-guarded RMS) — confirms real voice activity before any STT transcript
   const [voiceActive, setVoiceActive] = useState(false);
+  // Acoustic echo coupling strength (0..1) from the NLMS echo canceller — see onEchoCoupling below
+  const echoCouplingRef = useRef(0);
   
   // Numbered selection state: which card is currently selected/focused
   const [selectedResultIndex, setSelectedResultIndex] = useState<number | null>(null);
@@ -583,6 +585,12 @@ export default function Home() {
     onFastSignal: useCallback((text: string) => {
       tryEarlyBargeIn(text, "webSpeechAssist");
     }, [tryEarlyBargeIn]),
+    // Echo coupling strength (0..1) from the NLMS echo canceller — a ref, not state,
+    // since it updates ~2x/sec and only needs to be read when the duck effect below
+    // actually re-runs (on voiceActive/isPlaying changes), not on every tick itself.
+    onEchoCoupling: useCallback((strength: number) => {
+      echoCouplingRef.current = strength;
+    }, []),
     onError: useCallback((err: Error) => {
       log.error("Google STT error:", err);
     }, []),
@@ -599,12 +607,21 @@ export default function Home() {
   // Duck TTS volume while mic is active during AI speech — reduces speaker→mic echo.
   // Ambient duck while just listening; deeper duck once VAD confirms real voice activity
   // (duck-then-confirm: the actual cancel/send decision still waits on STT transcript below).
+  //
+  // Duck depth is blended by echo coupling strength (0..1, from the NLMS echo canceller):
+  // strong coupling (e.g. laptop built-in speaker) → duck all the way to the configured
+  // level; near-zero coupling (e.g. headphones — nothing to echo) → barely duck at all,
+  // since there's no real echo risk to guard against and ducking would only cost
+  // responsiveness/naturalness for no benefit.
   useEffect(() => {
     const shouldDuck =
       transcribe.isListening && (audioPlayer.isPlaying || wsStatus === "speaking");
 
     if (shouldDuck) {
-      duckSharedVolume(voiceActive ? TTS_VAD_DUCK_VOLUME : TTS_DUCK_VOLUME);
+      const coupling = Math.max(0, Math.min(1, echoCouplingRef.current));
+      const baseLevel = voiceActive ? TTS_VAD_DUCK_VOLUME : TTS_DUCK_VOLUME;
+      const duckTarget = 1 - coupling * (1 - baseLevel); // lerp(1, baseLevel, coupling)
+      duckSharedVolume(duckTarget);
     } else {
       restoreSharedVolume();
     }
