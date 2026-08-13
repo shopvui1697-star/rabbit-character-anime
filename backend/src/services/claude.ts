@@ -517,7 +517,8 @@ export async function chat(
   onToolUse?: () => void,  // Called when tool_use is detected (before DB search)
   userContext?: any,  // User context from user_profile (UserContext type)
   onGourmetSearch?: (query: string, area?: string, cuisine?: string) => Promise<string>,
-  activeResults?: ActiveResultSet | null  // Current active result set for numbered selection context
+  activeResults?: ActiveResultSet | null,  // Current active result set for numbered selection context
+  signal?: AbortSignal  // Aborts the underlying LLM call when superseded by a newer response (barge-in)
 ): Promise<ChatResponse> {
   const messages = [
     ...toClaudeMessages(history),
@@ -570,6 +571,7 @@ export async function chat(
         system: systemPrompt,
         messages,
         stop_sequences: STOP_SEQUENCES,
+        signal,
       })) {
         processStreamEvent(text, state, onChunk, onSentence);
       }
@@ -587,6 +589,7 @@ export async function chat(
       messages,
       stop_sequences: STOP_SEQUENCES,
       tools: useTools ? tools : undefined,
+      signal,
     });
 
     if (response.stop_reason === "tool_use") {
@@ -650,6 +653,7 @@ export async function chat(
               },
             ],
             stop_sequences: STOP_SEQUENCES,
+            signal,
           })) {
             processStreamEvent(text, state, onChunk, onSentence);
           }
@@ -677,6 +681,7 @@ export async function chat(
             },
           ],
           stop_sequences: STOP_SEQUENCES,
+          signal,
         });
 
         const textContent = followUpResponse.content
@@ -699,7 +704,12 @@ export async function chat(
     setCachedResponse(cacheKey, result);
     return result;
   } catch (error) {
-    log.error("Claude API error:", error);
+    const isAbort = error instanceof Error && (error.name === "AbortError" || error.name === "APIUserAbortError");
+    if (isAbort) {
+      log.debug("Claude API call aborted (superseded by a newer response)");
+    } else {
+      log.error("Claude API error:", error);
+    }
     throw error;
   }
 }

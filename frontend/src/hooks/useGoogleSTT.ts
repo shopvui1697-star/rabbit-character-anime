@@ -28,6 +28,11 @@ const DEFAULT_INTERIM_STABILITY_MS = parseInt(
   10
 );
 
+// Fast VAD (voice activity detection) duration-guard — confirms real speech from raw mic RMS
+// well before any STT transcript arrives. Reuses RMS_SPEECH_THRESHOLD above as the energy gate.
+const VAD_CONFIRM_MS = parseInt(process.env.NEXT_PUBLIC_VAD_CONFIRM_MS || "200", 10);
+const VAD_RELEASE_MS = parseInt(process.env.NEXT_PUBLIC_VAD_RELEASE_MS || "200", 10);
+
 /**
  * Global STT Instance Manager
  * Ensures only one STT session is active at a time
@@ -71,6 +76,22 @@ export interface UseGoogleSTTOptions {
   onError?: (error: Error) => void;
   onStart?: () => void;
   onStop?: () => void;
+  /**
+   * Fast, duration-guarded voice-activity signal computed from raw mic RMS —
+   * fires ~VAD_CONFIRM_MS after real speech energy starts, well before any STT
+   * transcript arrives. Not available when running on the Web Speech fallback
+   * (no raw audio access there).
+   */
+  onVoiceActivity?: (active: boolean) => void;
+  /**
+   * Fast Web Speech-derived signal used only to accelerate barge-in detection
+   * (duck/early-stop) while NineRouter/Groq is healthy — Web Speech is NOT
+   * authoritative in this mode; NineRouter's own transcript still drives final
+   * submission via `onTranscript`. Runs in parallel with the NineRouter mic
+   * capture (when the browser supports it). Web Speech only becomes
+   * authoritative in the exclusive-fallback path (routed through `onTranscript`).
+   */
+  onFastSignal?: (text: string, isFinal: boolean) => void;
   // Auto-stop configuration
   inactivityTimeout?: number;     // ms of silence before auto-stop (0 = disabled, default: 0)
   stopOnTabHidden?: boolean;      // Stop when tab hidden (default: true)
@@ -112,6 +133,8 @@ export function useGoogleSTT({
   onError,
   onStart,
   onStop,
+  onVoiceActivity,
+  onFastSignal,
   inactivityTimeout = 0,        // Disabled by default — user clicks mic to stop
   stopOnTabHidden = true,
   interimStabilityMs = DEFAULT_INTERIM_STABILITY_MS,
@@ -127,18 +150,28 @@ export function useGoogleSTT({
   const instanceId = useRef<string>(`google-stt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`);
   const isListeningRef = useRef(false);
   const usingWebSpeechRef = useRef(false);
+  // Role of the Web Speech instance: "fallback" = authoritative (NineRouter unavailable),
+  // "assist" = fast signal only in parallel with a healthy NineRouter stream, "off" = not running.
+  const webSpeechModeRef = useRef<"off" | "fallback" | "assist">("off");
   const startWebSpeechRef = useRef<(() => void) | null>(null);
   const stopWebSpeechRef = useRef<(() => void) | null>(null);
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
   const onStartRef = useRef(onStart);
   const onStopRef = useRef(onStop);
+  const onVoiceActivityRef = useRef(onVoiceActivity);
+  const onFastSignalRef = useRef(onFastSignal);
 
   // Interim stability detection refs
   const stabilityTimer = useRef<NodeJS.Timeout | null>(null);
   const lastInterimText = useRef<string>("");
   const lastSpeechChunkMs = useRef(0);
   const hadSpeechEnergyRef = useRef(false);
+
+  // Fast VAD duration-guard refs (see VAD_CONFIRM_MS / VAD_RELEASE_MS above)
+  const vadActiveRef = useRef(false);
+  const vadAboveSinceRef = useRef(0);
+  const vadBelowSinceRef = useRef(0);
 
   const emitTranscript = useCallback((text: string, isFinal: boolean) => {
     const cleaned = sanitizeTranscript(text, isFinal, hadSpeechEnergyRef.current);
@@ -166,26 +199,55 @@ export function useGoogleSTT({
     onErrorRef.current = onError;
     onStartRef.current = onStart;
     onStopRef.current = onStop;
-  }, [onTranscript, onError, onStart, onStop]);
+    onVoiceActivityRef.current = onVoiceActivity;
+    onFastSignalRef.current = onFastSignal;
+  }, [onTranscript, onError, onStart, onStop, onVoiceActivity, onFastSignal]);
 
-  const webSpeech = useWebSpeechFallback({
-    languageCode: config.languageCode || "en-US",
-    onTranscript,
-    onError,
-    onStart: () => {
+  // Web Speech transcript: authoritative in "fallback" mode (routed to onTranscript,
+  // same as before), fast-signal-only in "assist" mode (routed to onFastSignal instead).
+  const handleWebSpeechTranscript = useCallback((text: string, isFinal: boolean) => {
+    if (webSpeechModeRef.current === "fallback") {
+      onTranscriptRef.current?.(text, isFinal);
+    } else if (webSpeechModeRef.current === "assist") {
+      onFastSignalRef.current?.(text, isFinal);
+    }
+  }, []);
+
+  const handleWebSpeechError = useCallback((err: Error) => {
+    if (webSpeechModeRef.current === "fallback") {
+      onErrorRef.current?.(err);
+    }
+    // Assist mode: Web Speech errors are non-fatal — NineRouter stays authoritative
+  }, []);
+
+  const handleWebSpeechStart = useCallback(() => {
+    if (webSpeechModeRef.current === "fallback") {
       usingWebSpeechRef.current = true;
       isListeningRef.current = true;
       setUseWebSpeech(true);
       setIsListening(true);
-      onStart?.();
-    },
-    onStop: () => {
+      onStartRef.current?.();
+    }
+    // Assist mode: NineRouter's own onStart already fired — no public state change
+  }, []);
+
+  const handleWebSpeechStop = useCallback(() => {
+    if (webSpeechModeRef.current === "fallback") {
       usingWebSpeechRef.current = false;
       isListeningRef.current = false;
       setUseWebSpeech(false);
       setIsListening(false);
-      onStop?.();
-    },
+      onStopRef.current?.();
+    }
+    webSpeechModeRef.current = "off";
+  }, []);
+
+  const webSpeech = useWebSpeechFallback({
+    languageCode: config.languageCode || "en-US",
+    onTranscript: handleWebSpeechTranscript,
+    onError: handleWebSpeechError,
+    onStart: handleWebSpeechStart,
+    onStop: handleWebSpeechStop,
   });
 
   useEffect(() => {
@@ -200,6 +262,9 @@ export function useGoogleSTT({
     }
 
     log.warn(`Backend STT unavailable (${reason}) — falling back to Web Speech API`);
+    // Reclassify as authoritative — if an assist instance is already running (started
+    // alongside NineRouter), this flips its role; startListening() below is then a no-op.
+    webSpeechModeRef.current = "fallback";
     usingWebSpeechRef.current = true;
     setUseWebSpeech(true);
     setError(null);
@@ -299,6 +364,13 @@ export function useGoogleSTT({
             log.error("❌ Backend STT error:", errMsg);
 
             if (isListeningRef.current && !usingWebSpeechRef.current && isBackendSttSetupError(errMsg)) {
+              // If Web Speech is already running as an assist signal, detach it first so
+              // stopListeningInternal() below doesn't stop it — calling stop() then start()
+              // back-to-back on the same SpeechRecognition object races the browser's async
+              // stop lifecycle. fallbackToWebSpeech() reclaims the still-running instance.
+              if (webSpeechModeRef.current === "assist") {
+                webSpeechModeRef.current = "off";
+              }
               stopListeningInternal(false);
               if (fallbackToWebSpeech(errMsg)) {
                 break;
@@ -367,6 +439,18 @@ export function useGoogleSTT({
     lastInterimText.current = "";
     hadSpeechEnergyRef.current = false;
     lastSpeechChunkMs.current = 0;
+    if (vadActiveRef.current) {
+      vadActiveRef.current = false;
+      onVoiceActivityRef.current?.(false);
+    }
+    vadAboveSinceRef.current = 0;
+    vadBelowSinceRef.current = 0;
+
+    // Stop the parallel Web Speech assist instance, if running
+    if (webSpeechModeRef.current === "assist") {
+      stopWebSpeechRef.current?.();
+      webSpeechModeRef.current = "off";
+    }
 
     // Stop audio capture
     if (audioCapture.current) {
@@ -444,6 +528,9 @@ export function useGoogleSTT({
       lastInterimText.current = "";
       hadSpeechEnergyRef.current = false;
       lastSpeechChunkMs.current = 0;
+      vadActiveRef.current = false;
+      vadAboveSinceRef.current = 0;
+      vadBelowSinceRef.current = 0;
       clearStabilityTimer();
 
       // Tell backend to start STT stream
@@ -474,6 +561,24 @@ export function useGoogleSTT({
             hadSpeechEnergyRef.current = true;
           }
 
+          // Fast VAD signal (duration-guarded): confirms/releases on sustained
+          // RMS above/below threshold, independent of the STT round-trip.
+          if (isSpeech) {
+            vadBelowSinceRef.current = 0;
+            if (vadAboveSinceRef.current === 0) vadAboveSinceRef.current = now;
+            if (!vadActiveRef.current && now - vadAboveSinceRef.current >= VAD_CONFIRM_MS) {
+              vadActiveRef.current = true;
+              onVoiceActivityRef.current?.(true);
+            }
+          } else {
+            vadAboveSinceRef.current = 0;
+            if (vadBelowSinceRef.current === 0) vadBelowSinceRef.current = now;
+            if (vadActiveRef.current && now - vadBelowSinceRef.current >= VAD_RELEASE_MS) {
+              vadActiveRef.current = false;
+              onVoiceActivityRef.current?.(false);
+            }
+          }
+
           const inHangover = now - lastSpeechChunkMs.current < RMS_HANGOVER_MS;
           if (!isSpeech && !inHangover) {
             return; // Skip silent chunks — reduces Whisper hallucination on noise
@@ -493,6 +598,13 @@ export function useGoogleSTT({
       isListeningRef.current = true;
       setIsListening(true);
       onStartRef.current?.();
+
+      // Start Web Speech in parallel as a fast assist signal (not authoritative) —
+      // only while NineRouter is the active path and a consumer is actually wired up.
+      if (onFastSignalRef.current && isWebSpeechSupported()) {
+        webSpeechModeRef.current = "assist";
+        startWebSpeechRef.current?.();
+      }
 
       // Start inactivity timer (if enabled)
       resetInactivityTimer();

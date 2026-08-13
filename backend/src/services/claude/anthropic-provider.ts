@@ -22,6 +22,7 @@ export interface AnthropicRequest {
   messages: Array<{ role: string; content: string | any[] }>;
   stop_sequences?: string[];
   tools?: any[];
+  signal?: AbortSignal;
 }
 
 export interface AnthropicResponse {
@@ -53,7 +54,7 @@ export async function invokeAnthropic(request: AnthropicRequest): Promise<Anthro
       messages: request.messages as Anthropic.MessageParam[],
       stop_sequences: request.stop_sequences,
       tools: request.tools,
-    });
+    }, { signal: request.signal });
 
     const duration = Date.now() - startTime;
     
@@ -100,7 +101,7 @@ export async function* invokeAnthropicStream(
       messages: request.messages as Anthropic.MessageParam[],
       stop_sequences: request.stop_sequences,
       tools: request.tools,
-    });
+    }, { signal: request.signal });
 
     for await (const event of stream) {
       if (event.type === "content_block_delta" && event.delta.type === "text_delta") {

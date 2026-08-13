@@ -32,6 +32,7 @@ interface BedrockRequest {
   top_p?: number;
   stop_sequences?: string[];
   tools?: any[];
+  signal?: AbortSignal;
 }
 
 interface BedrockResponse {
@@ -58,16 +59,18 @@ interface BedrockResponse {
 export async function invokeBedrockClaude(
   request: BedrockRequest
 ): Promise<BedrockResponse> {
+  // Strip `signal` before serializing — it's a transport option, not part of the Bedrock body
+  const { signal, ...bedrockBody } = request;
   const command = new InvokeModelCommand({
     modelId: config.bedrock.modelId,
     contentType: "application/json",
     accept: "application/json",
-    body: JSON.stringify(request),
+    body: JSON.stringify(bedrockBody),
   });
 
   try {
     const startTime = Date.now();
-    const response = await bedrockClient.send(command);
+    const response = await bedrockClient.send(command, { abortSignal: signal });
     const duration = Date.now() - startTime;
     
     const responseBody = JSON.parse(new TextDecoder().decode(response.body));
@@ -92,16 +95,18 @@ export async function invokeBedrockClaude(
 export async function* invokeBedrockClaudeStream(
   request: BedrockRequest
 ): AsyncGenerator<string, BedrockResponse | null, unknown> {
+  // Strip `signal` before serializing — it's a transport option, not part of the Bedrock body
+  const { signal, ...bedrockBody } = request;
   const command = new InvokeModelWithResponseStreamCommand({
     modelId: config.bedrock.modelId,
     contentType: "application/json",
     accept: "application/json",
-    body: JSON.stringify(request),
+    body: JSON.stringify(bedrockBody),
   });
 
   try {
     const startTime = Date.now();
-    const response = await bedrockClient.send(command);
+    const response = await bedrockClient.send(command, { abortSignal: signal });
 
     if (!response.body) {
       throw new Error("No response body from Bedrock");

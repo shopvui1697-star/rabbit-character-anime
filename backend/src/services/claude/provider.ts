@@ -19,6 +19,7 @@ interface LLMRequest {
   messages: Array<{ role: string; content: string | any[] }>;
   stop_sequences?: string[];
   tools?: any[];
+  signal?: AbortSignal;
 }
 
 interface LLMResponse {
@@ -52,6 +53,7 @@ export async function invokeLLM(request: LLMRequest): Promise<LLMResponse> {
       messages: convertToBedrockMessages(request.messages),
       stop_sequences: request.stop_sequences,
       tools: request.tools,
+      signal: request.signal,
     };
 
     const response = await invokeBedrockClaude(bedrockRequest);
@@ -80,6 +82,7 @@ export async function invokeLLM(request: LLMRequest): Promise<LLMResponse> {
       messages: request.messages,
       stop_sequences: request.stop_sequences,
       tools: request.tools,
+      signal: request.signal,
     });
 
     // Log usage for cost tracking
@@ -115,6 +118,7 @@ export async function* invokeLLMStream(
       messages: convertToBedrockMessages(request.messages),
       stop_sequences: request.stop_sequences,
       tools: request.tools,
+      signal: request.signal,
     };
 
     const streamGenerator = invokeBedrockClaudeStream(bedrockRequest);
@@ -135,6 +139,7 @@ export async function* invokeLLMStream(
       messages: request.messages,
       stop_sequences: request.stop_sequences,
       tools: request.tools,
+      signal: request.signal,
     });
   }
 }

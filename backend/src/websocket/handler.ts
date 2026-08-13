@@ -148,6 +148,7 @@ interface Session {
   status: ConversationStatus;
   pendingRequest: boolean;
   currentResponseId: string | null;  // Track current response for barge-in cancellation
+  currentAbortController: AbortController | null;  // Aborts the in-flight LLM call on barge-in
   lastActivityTime: number;  // For idle timeout cleanup
   requestCount: number;  // For rate limiting
   requestWindowStart: number;  // Rate limit window start time
@@ -719,7 +720,13 @@ async function processUserInput(session: Session, userText: string): Promise<voi
     sessionLog.debug("Cancelling previous response (barge-in)");
   }
   session.currentResponseId = responseId;
-  
+
+  // Actually abort the previous in-flight LLM call (not just skip delivery) —
+  // saves tokens/latency on barge-in instead of letting the old request run to completion.
+  session.currentAbortController?.abort();
+  const abortController = new AbortController();
+  session.currentAbortController = abortController;
+
   // Reset pendingRequest flag (allow new request to override)
   session.pendingRequest = true;
   
@@ -1092,7 +1099,8 @@ async function processUserInput(session: Session, userText: string): Promise<voi
         
         return formatGourmetResults(result); // Return formatted string for LLM
       },
-      session.activeResults  // Pass active results for numbered selection context
+      session.activeResults,  // Pass active results for numbered selection context
+      abortController.signal  // Abort the LLM call itself when superseded by barge-in
     );
 
     workflow.endStep({
@@ -1332,9 +1340,15 @@ async function processUserInput(session: Session, userText: string): Promise<voi
     }
 
   } catch (error) {
-    sessionLog.error("Process input error:", error);
-    log.error("Process input error:", error);
+    const isAbort = error instanceof Error && (error.name === "AbortError" || error.name === "APIUserAbortError");
+    if (isAbort) {
+      sessionLog.debug("LLM call aborted (superseded by barge-in)");
+    } else {
+      sessionLog.error("Process input error:", error);
+      log.error("Process input error:", error);
+    }
     // Only update status if this response is still current
+    // (an aborted request is by definition no longer current, so this is also skipped for it)
     if (session.currentResponseId === responseId) {
       workflow.logSummary();
       session.status = "idle";
@@ -1344,6 +1358,10 @@ async function processUserInput(session: Session, userText: string): Promise<voi
   } finally {
     // Always reset pending flag
     session.pendingRequest = false;
+    // Clear the abort controller only if it's still ours (a newer request may have replaced it)
+    if (session.currentAbortController === abortController) {
+      session.currentAbortController = null;
+    }
   }
 }
 
@@ -1856,6 +1874,7 @@ export function handleConnection(ws: WebSocket): void {
     status: "idle",
     pendingRequest: false,
     currentResponseId: null,
+    currentAbortController: null,
     lastActivityTime: now,
     requestCount: 0,
     requestWindowStart: now,

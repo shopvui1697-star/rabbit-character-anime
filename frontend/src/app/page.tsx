@@ -44,6 +44,9 @@ const EARLY_BARGE_IN_MIN_CHARS = parseInt(process.env.NEXT_PUBLIC_EARLY_BARGE_IN
 // Duck TTS volume while mic is active during AI speech (0.0–1.0, default 0.25)
 const TTS_DUCK_VOLUME = parseFloat(process.env.NEXT_PUBLIC_TTS_DUCK_VOLUME || "0.25");
 
+// Deeper duck once fast VAD confirms real voice activity (vs the ambient duck above)
+const TTS_VAD_DUCK_VOLUME = parseFloat(process.env.NEXT_PUBLIC_TTS_VAD_DUCK_VOLUME || "0.08");
+
 export default function Home() {
   // Unlock AudioContext on first user gesture (required for iOS Safari)
   // and preload waiting sounds into AudioBuffer cache
@@ -114,6 +117,8 @@ export default function Home() {
     },
   });
   const [voiceDetected, setVoiceDetected] = useState(false);
+  // Fast VAD signal (duration-guarded RMS) — confirms real voice activity before any STT transcript
+  const [voiceActive, setVoiceActive] = useState(false);
   
   // Numbered selection state: which card is currently selected/focused
   const [selectedResultIndex, setSelectedResultIndex] = useState<number | null>(null);
@@ -479,6 +484,42 @@ export default function Home() {
     }
   }, [wsSendMessage, audioPlayer, waitingPhrase, userId, handleSaveToArchive, messages, selectedResultIndex]);
 
+  // Shared early-barge-in trigger — used both by NineRouter's own interim transcript
+  // and by the Web Speech assist signal (§9.4.L), whichever fires first "wins".
+  // Only ducks/cancels audio; final submission is always driven by NineRouter's onTranscript.
+  const tryEarlyBargeIn = useCallback((rawText: string, source: string) => {
+    const trimmedText = rawText.trim();
+    if (!trimmedText) return;
+
+    const aiSpeaking = audioPlayer.isPlaying || wsStatus === "speaking";
+    const bargeInCheck = checkBargeIn({
+      text: trimmedText,
+      isFinal: false,
+      aiSpeaking,
+      earlyMinChars: EARLY_BARGE_IN_MIN_CHARS,
+    });
+
+    if (!bargeInCheck.allowed) {
+      if (bargeInCheck.reason === "echo") {
+        log.debug(`🚫 Echo filtered (${source}): "${trimmedText}"`);
+      } else if (bargeInCheck.reason === "cooldown") {
+        log.debug(`⏳ Barge-in cooldown (${source}): ignoring "${trimmedText}"`);
+      }
+      return;
+    }
+
+    if (
+      aiSpeaking &&
+      trimmedText.length >= EARLY_BARGE_IN_MIN_CHARS &&
+      !earlyBargeInTriggeredRef.current
+    ) {
+      log.debug(`🟡 EARLY BARGE-IN (${source}): Stopping audio (${trimmedText.length} chars detected)`);
+      audioPlayer.cancelAllAudio();
+      restoreSharedVolume();
+      earlyBargeInTriggeredRef.current = true;
+    }
+  }, [audioPlayer, wsStatus]);
+
   // Google STT for voice input (streamed via backend WebSocket)
   // Backend handles Google's 5-minute stream limit transparently — no frontend refresh needed.
   // Mic stays on until user explicitly clicks stop. Barge-in supported via early interim detection.
@@ -490,12 +531,18 @@ export default function Home() {
     onTranscript: useCallback((text: string, isFinal: boolean) => {
       log.debug(`📝 Transcript ${isFinal ? "(final)" : "(interim)"}:`, text);
 
+      if (!isFinal) {
+        tryEarlyBargeIn(text, "nineRouter");
+        return;
+      }
+
+      // FINAL: Submit transcript — NineRouter/Groq stays the sole source of truth for this
       const trimmedText = text.trim();
       const aiSpeaking = audioPlayer.isPlaying || wsStatus === "speaking";
 
       const bargeInCheck = checkBargeIn({
         text: trimmedText,
-        isFinal,
+        isFinal: true,
         aiSpeaking,
         earlyMinChars: EARLY_BARGE_IN_MIN_CHARS,
       });
@@ -503,46 +550,39 @@ export default function Home() {
       if (!bargeInCheck.allowed) {
         if (bargeInCheck.reason === "echo") {
           log.debug(`🚫 Echo filtered: "${trimmedText}"`);
-        } else if (bargeInCheck.reason === "cooldown") {
-          log.debug(`⏳ Barge-in cooldown: ignoring interim "${trimmedText}"`);
         }
         return;
       }
 
-      // EARLY BARGE-IN: Stop audio when we detect speech
-      if (!isFinal && trimmedText.length >= EARLY_BARGE_IN_MIN_CHARS) {
-        if (aiSpeaking && !earlyBargeInTriggeredRef.current) {
-          log.debug(`🟡 EARLY BARGE-IN: Stopping audio (${trimmedText.length} chars detected)`);
-          audioPlayer.cancelAllAudio();
-          restoreSharedVolume();
-          earlyBargeInTriggeredRef.current = true;
-        }
+      earlyBargeInTriggeredRef.current = false;
+
+      if (!trimmedText || trimmedText.length < BARGE_IN_MIN_CHARS) {
+        log.debug(`⏭️ Transcript too short (${trimmedText.length} chars), ignoring`);
+        return;
       }
 
-      // FINAL: Submit transcript
-      if (isFinal && trimmedText) {
-        earlyBargeInTriggeredRef.current = false;
-
-        if (trimmedText.length < BARGE_IN_MIN_CHARS) {
-          log.debug(`⏭️ Transcript too short (${trimmedText.length} chars), ignoring`);
-          return;
-        }
-
-        // Regular barge-in if early wasn't triggered
-        if (aiSpeaking) {
-          log.debug("🔇 REGULAR BARGE-IN: Stopping audio");
-          audioPlayer.cancelAllAudio();
-          restoreSharedVolume();
-        }
-
-        // Send to sendMessage - it will handle command detection and hiragana conversion
-        // Mic stays on for continuous conversation (barge-in supported)
-        log.debug(`✅ Submitting: "${trimmedText}"`);
-        sendMessage(trimmedText).catch((err) => {
-          log.error("Failed to send message:", err);
-        });
+      // Regular barge-in if early wasn't triggered
+      if (aiSpeaking) {
+        log.debug("🔇 REGULAR BARGE-IN: Stopping audio");
+        audioPlayer.cancelAllAudio();
+        restoreSharedVolume();
       }
-    }, [audioPlayer, wsStatus, sendMessage]),
+
+      // Send to sendMessage - it will handle command detection and hiragana conversion
+      // Mic stays on for continuous conversation (barge-in supported)
+      log.debug(`✅ Submitting: "${trimmedText}"`);
+      sendMessage(trimmedText).catch((err) => {
+        log.error("Failed to send message:", err);
+      });
+    }, [audioPlayer, wsStatus, sendMessage, tryEarlyBargeIn]),
+    onVoiceActivity: useCallback((active: boolean) => {
+      setVoiceActive(active);
+    }, []),
+    // Web Speech assist signal (§9.4.L) — fast, not authoritative. Runs in parallel with
+    // NineRouter when supported; only accelerates the early-barge-in duck/cancel above.
+    onFastSignal: useCallback((text: string) => {
+      tryEarlyBargeIn(text, "webSpeechAssist");
+    }, [tryEarlyBargeIn]),
     onError: useCallback((err: Error) => {
       log.error("Google STT error:", err);
     }, []),
@@ -556,22 +596,24 @@ export default function Home() {
     }
   }, [messages]);
 
-  // Duck TTS volume while mic is active during AI speech — reduces speaker→mic echo
+  // Duck TTS volume while mic is active during AI speech — reduces speaker→mic echo.
+  // Ambient duck while just listening; deeper duck once VAD confirms real voice activity
+  // (duck-then-confirm: the actual cancel/send decision still waits on STT transcript below).
   useEffect(() => {
     const shouldDuck =
       transcribe.isListening && (audioPlayer.isPlaying || wsStatus === "speaking");
 
     if (shouldDuck) {
-      duckSharedVolume(TTS_DUCK_VOLUME);
+      duckSharedVolume(voiceActive ? TTS_VAD_DUCK_VOLUME : TTS_DUCK_VOLUME);
     } else {
       restoreSharedVolume();
     }
-  }, [transcribe.isListening, audioPlayer.isPlaying, wsStatus]);
+  }, [transcribe.isListening, audioPlayer.isPlaying, wsStatus, voiceActive]);
 
-  // VAD for visual feedback
+  // Visual "listening" indicator — fast VAD signal or interim transcript, whichever comes first
   const checkVoiceActivity = useCallback(() => {
-    setVoiceDetected(transcribe.interimTranscript.length > 0);
-  }, [transcribe.interimTranscript]);
+    setVoiceDetected(voiceActive || transcribe.interimTranscript.length > 0);
+  }, [voiceActive, transcribe.interimTranscript]);
 
   React.useEffect(() => {
     checkVoiceActivity();

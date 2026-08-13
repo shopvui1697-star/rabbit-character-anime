@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "agents": [
+    "claude-code"
+  ],
+  "skills": {
+    "mobile": {
+      "version": "2.3.0",
+      "sha": "8dacbfb9e8b7ea32ba5c3d2a032fea0beb25593a8bc9688c450a6da3a0218f63",
+      "tier": "VERIFIED",
+      "installedAt": "2026-08-13T04:10:30.817Z",
+      "source": "github:anton-abyzov/vskill#plugin:mobile",
+      "scope": "project",
+      "files": [
+        "appstore/SKILL.md"
+      ]
+    }
+  },
+  "createdAt": "2026-08-13T04:10:30.816Z",
+  "updatedAt": "2026-08-13T04:10:30.817Z"
+}
