@@ -18,6 +18,11 @@ import {
   type SttEndpointConfig,
   toIso639Language,
 } from "./client.js";
+import {
+  hasSpeechEnergy,
+  sanitizeTranscript,
+  STT_MIN_SPEECH_RMS,
+} from "../../utils/sttGuard.js";
 
 const log = createLogger("NineRouterSTT");
 
@@ -52,6 +57,8 @@ export class NineRouterSTTSession {
   private pendingFinal = false;
   private endpoint: SttEndpointConfig | null = null;
   private credentialErrorReported = false;
+  private hadSpeechEnergy = false;
+  private silentTranscribeCount = 0;
 
   constructor(sttConfig: NineRouterSTTConfig, callbacks: NineRouterSTTCallbacks) {
     this.config = sttConfig;
@@ -69,6 +76,8 @@ export class NineRouterSTTSession {
     this.lastTranscript = "";
     this.pendingFinal = false;
     this.credentialErrorReported = false;
+    this.hadSpeechEnergy = false;
+    this.silentTranscribeCount = 0;
     this.endpoint = await resolveSttEndpoint(this.config.model);
 
     if (this.endpoint.source === "ninerouter") {
@@ -134,8 +143,10 @@ export class NineRouterSTTSession {
     }
   }
 
-  private getMinAudioBytes(): number {
-    return Math.floor(this.config.sampleRateHertz * 2 * 0.3);
+  private getMinAudioBytes(isFinal: boolean): number {
+    // Interim: require ≥0.8s audio to reduce Whisper hallucination on short noise
+    const seconds = isFinal ? 0.4 : 0.8;
+    return Math.floor(this.config.sampleRateHertz * 2 * seconds);
   }
 
   private getWindowBuffer(): Buffer {
@@ -168,28 +179,68 @@ export class NineRouterSTTSession {
     }
 
     const pcm = isFinal ? this.getFullBuffer() : this.getWindowBuffer();
-    if (pcm.length < this.getMinAudioBytes()) {
-      if (isFinal && this.lastTranscript) {
-        this.callbacks.onTranscript(this.lastTranscript, true);
+    const minBytes = this.getMinAudioBytes(isFinal);
+    if (pcm.length < minBytes) {
+      if (isFinal && this.lastTranscript && this.hadSpeechEnergy) {
+        const cleaned = sanitizeTranscript(this.lastTranscript, {
+          isFinal: true,
+          hadSpeechEnergy: true,
+        });
+        if (cleaned) {
+          this.callbacks.onTranscript(cleaned, true);
+        }
       }
       return;
+    }
+
+    const speechDetected = hasSpeechEnergy(pcm);
+    if (speechDetected) {
+      this.hadSpeechEnergy = true;
+      this.silentTranscribeCount = 0;
+    } else {
+      this.silentTranscribeCount++;
+      // Skip Whisper call on silent audio — main anti-hallucination gate
+      if (!isFinal) {
+        if (this.silentTranscribeCount >= 5) {
+          // Drop stale buffer after prolonged silence to avoid noise buildup
+          this.audioChunks = [];
+          this.totalBytes = 0;
+          this.lastTranscript = "";
+        }
+        log.debug(`🔇 Skipping interim STT — silence (RMS < ${STT_MIN_SPEECH_RMS})`);
+        return;
+      }
+      if (!this.hadSpeechEnergy) {
+        log.debug("🔇 Skipping final STT — no speech detected in session");
+        return;
+      }
     }
 
     this.inFlight = true;
 
     try {
-      const text = await this.requestTranscription(pcm);
-      if (!text) return;
+      const rawText = await this.requestTranscription(pcm);
+      if (!rawText) return;
 
-      if (isFinal) {
-        this.callbacks.onTranscript(text, true);
-        this.lastTranscript = text;
+      const cleaned = sanitizeTranscript(rawText, {
+        isFinal,
+        hadSpeechEnergy: speechDetected || this.hadSpeechEnergy,
+      });
+
+      if (!cleaned) {
+        log.debug(`🚫 Rejected STT output (hallucination/noise): "${rawText}"`);
         return;
       }
 
-      if (this.config.enableInterimResults !== false && text !== this.lastTranscript) {
-        this.lastTranscript = text;
-        this.callbacks.onTranscript(text, false);
+      if (isFinal) {
+        this.callbacks.onTranscript(cleaned, true);
+        this.lastTranscript = cleaned;
+        return;
+      }
+
+      if (this.config.enableInterimResults !== false && cleaned !== this.lastTranscript) {
+        this.lastTranscript = cleaned;
+        this.callbacks.onTranscript(cleaned, false);
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -213,6 +264,7 @@ export class NineRouterSTTSession {
     form.append("file", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "audio.wav");
     form.append("language", toIso639Language(this.config.languageCode));
     form.append("response_format", "json");
+    form.append("temperature", "0");
 
     const headers: Record<string, string> = {};
     if (endpoint.apiKey) {
@@ -247,6 +299,8 @@ export class NineRouterSTTSession {
         this.audioChunks = [];
         this.totalBytes = 0;
         this.lastTranscript = "";
+        this.hadSpeechEnergy = false;
+        this.silentTranscribeCount = 0;
         this.callbacks.onStopped?.();
       });
       return;
@@ -255,6 +309,8 @@ export class NineRouterSTTSession {
     this.audioChunks = [];
     this.totalBytes = 0;
     this.lastTranscript = "";
+    this.hadSpeechEnergy = false;
+    this.silentTranscribeCount = 0;
     this.callbacks.onStopped?.();
   }
 }

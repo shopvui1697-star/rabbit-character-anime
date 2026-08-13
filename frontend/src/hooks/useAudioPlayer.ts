@@ -22,6 +22,8 @@ interface AudioChunk {
 interface UseAudioPlayerOptions {
   /** Called when a chunk starts playing, with its sentence text (for sentence sync display) */
   onSentencePlay?: (sentence: string, index: number) => void;
+  /** Called when TTS playback begins (each chunk/full audio) — for echo guard cooldown */
+  onPlaybackStart?: () => void;
 }
 
 interface UseAudioPlayerReturn {
@@ -37,9 +39,11 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
   const [isPlaying, setIsPlaying] = useState(false);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-  // Keep onSentencePlay callback ref updated (avoids stale closures)
+  // Keep callback refs updated (avoids stale closures)
   const onSentencePlayRef = useRef(options?.onSentencePlay);
   onSentencePlayRef.current = options?.onSentencePlay;
+  const onPlaybackStartRef = useRef(options?.onPlaybackStart);
+  onPlaybackStartRef.current = options?.onPlaybackStart;
 
   // Queue for chunked audio playback
   const audioQueueRef = useRef<Map<number, string>>(new Map());
@@ -159,6 +163,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
         // Decode and play via Web Audio API
         const { source } = await playAudioFromBase64(base64Audio, format);
         sourceRef.current = source;
+        onPlaybackStartRef.current?.();
         setIsPlaying(true);
 
         source.onended = async () => {
@@ -254,6 +259,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     
     chunkPlayStartRef.current = now;
     log.debug(`▶️ Playing chunk ${nextIndex}/${totalChunksRef.current}`);
+    onPlaybackStartRef.current?.();
 
     // Notify parent: sentence text should be displayed NOW (sync with audio start)
     const sentenceText = sentenceQueueRef.current.get(nextIndex);
@@ -376,6 +382,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       isPlayingQueueRef.current = true;
       isProcessingChunkRef.current = false;
       currentChunkIndexRef.current = 0;
+      onPlaybackStartRef.current?.();
       setIsPlaying(true);
       processNextChunk();
       return;

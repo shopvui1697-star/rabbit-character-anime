@@ -7,12 +7,18 @@ import { useGoogleSTT } from "@/hooks/useGoogleSTT";
 import { useWaitingPhrase } from "@/hooks/useWaitingPhrase";
 import { RabbitAvatar, ChatHistory, ChatInput, WorkflowTimingDisplay, SearchResultsPanel } from "@/components";
 import { createLogger } from "@/utils/logger";
-import { unlockAudio, preloadWaitingSounds, setupVisibilityHandler } from "@/utils/audioUnlock";
+import { unlockAudio, preloadWaitingSounds, setupVisibilityHandler, duckSharedVolume, restoreSharedVolume } from "@/utils/audioUnlock";
 import { shouldPlayWaitingPhrase } from "@/utils/keywordDetection";
 import { detectCommand } from "@/utils/voiceCommands";
 import { executeCommand, type CommandContext } from "@/utils/commandExecutor";
 import archiveStorage from "@/utils/archiveStorage";
 import { toHiragana, preloadConverter } from "@/utils/hiraganaConverter";
+import {
+  checkBargeIn,
+  clearTtsContent,
+  notifyTtsPlaybackStarted,
+  registerTtsContent,
+} from "@/utils/bargeInGuard";
 import type { ConversationStatus, DomainType, ArchiveItemInfo, SearchResults } from "@/types";
 import styles from "./page.module.css";
 
@@ -34,6 +40,9 @@ const BARGE_IN_MIN_CHARS = parseInt(process.env.NEXT_PUBLIC_BARGE_IN_MIN_CHARS |
 
 // Minimum characters for early barge-in detection (using partial transcripts)
 const EARLY_BARGE_IN_MIN_CHARS = parseInt(process.env.NEXT_PUBLIC_EARLY_BARGE_IN_MIN_CHARS || "2", 10);
+
+// Duck TTS volume while mic is active during AI speech (0.0–1.0, default 0.25)
+const TTS_DUCK_VOLUME = parseFloat(process.env.NEXT_PUBLIC_TTS_DUCK_VOLUME || "0.25");
 
 export default function Home() {
   // Unlock AudioContext on first user gesture (required for iOS Safari)
@@ -82,9 +91,20 @@ export default function Home() {
   const sentenceSyncMessageIdRef = useRef<string | null>(null);
   // Ref-based bridge to call appendToMessage from useAudioPlayer callback
   const appendToMessageRef = useRef<((messageId: string, sentence: string) => void) | null>(null);
+  // Track if early barge-in was triggered (reset on final transcript)
+  const earlyBargeInTriggeredRef = useRef(false);
+  // Latest assistant text for echo matching on non-sentence-sync audio
+  const lastAssistantTextRef = useRef("");
 
   const audioPlayer = useAudioPlayer({
+    onPlaybackStart: () => {
+      notifyTtsPlaybackStarted();
+      if (lastAssistantTextRef.current) {
+        registerTtsContent(lastAssistantTextRef.current);
+      }
+    },
     onSentencePlay: (sentence, index) => {
+      registerTtsContent(sentence);
       // When audio chunk N starts playing, display its sentence text
       const messageId = sentenceSyncMessageIdRef.current;
       if (messageId && appendToMessageRef.current) {
@@ -97,9 +117,6 @@ export default function Home() {
   
   // Numbered selection state: which card is currently selected/focused
   const [selectedResultIndex, setSelectedResultIndex] = useState<number | null>(null);
-
-  // Track if early barge-in was triggered (reset on final transcript)
-  const earlyBargeInTriggeredRef = useRef(false);
 
   // Queue for audio that arrives while short-waiting is still playing
   const pendingAudioQueueRef = useRef<Array<
@@ -162,6 +179,9 @@ export default function Home() {
         return;
       }
 
+      if (chunk.sentence) {
+        registerTtsContent(chunk.sentence);
+      }
       audioPlayer.playChunk(chunk);
     },
     [audioPlayer, waitingPhrase]
@@ -391,6 +411,8 @@ export default function Home() {
 
     // CRITICAL: Cancel all audio - stops current playback and rejects old audio
     audioPlayer.cancelAllAudio();
+    clearTtsContent();
+    restoreSharedVolume();
 
     // Reset sentence sync state for new response
     sentenceSyncMessageIdRef.current = null;
@@ -469,12 +491,30 @@ export default function Home() {
       log.debug(`📝 Transcript ${isFinal ? "(final)" : "(interim)"}:`, text);
 
       const trimmedText = text.trim();
+      const aiSpeaking = audioPlayer.isPlaying || wsStatus === "speaking";
+
+      const bargeInCheck = checkBargeIn({
+        text: trimmedText,
+        isFinal,
+        aiSpeaking,
+        earlyMinChars: EARLY_BARGE_IN_MIN_CHARS,
+      });
+
+      if (!bargeInCheck.allowed) {
+        if (bargeInCheck.reason === "echo") {
+          log.debug(`🚫 Echo filtered: "${trimmedText}"`);
+        } else if (bargeInCheck.reason === "cooldown") {
+          log.debug(`⏳ Barge-in cooldown: ignoring interim "${trimmedText}"`);
+        }
+        return;
+      }
 
       // EARLY BARGE-IN: Stop audio when we detect speech
       if (!isFinal && trimmedText.length >= EARLY_BARGE_IN_MIN_CHARS) {
-        if ((audioPlayer.isPlaying || wsStatus === "speaking") && !earlyBargeInTriggeredRef.current) {
+        if (aiSpeaking && !earlyBargeInTriggeredRef.current) {
           log.debug(`🟡 EARLY BARGE-IN: Stopping audio (${trimmedText.length} chars detected)`);
           audioPlayer.cancelAllAudio();
+          restoreSharedVolume();
           earlyBargeInTriggeredRef.current = true;
         }
       }
@@ -489,9 +529,10 @@ export default function Home() {
         }
 
         // Regular barge-in if early wasn't triggered
-        if (audioPlayer.isPlaying || wsStatus === "speaking") {
+        if (aiSpeaking) {
           log.debug("🔇 REGULAR BARGE-IN: Stopping audio");
           audioPlayer.cancelAllAudio();
+          restoreSharedVolume();
         }
 
         // Send to sendMessage - it will handle command detection and hiragana conversion
@@ -506,6 +547,26 @@ export default function Home() {
       log.error("Google STT error:", err);
     }, []),
   });
+
+  // Keep latest assistant text for echo filter (non-chunked TTS)
+  useEffect(() => {
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+    if (lastAssistant?.content) {
+      lastAssistantTextRef.current = lastAssistant.content;
+    }
+  }, [messages]);
+
+  // Duck TTS volume while mic is active during AI speech — reduces speaker→mic echo
+  useEffect(() => {
+    const shouldDuck =
+      transcribe.isListening && (audioPlayer.isPlaying || wsStatus === "speaking");
+
+    if (shouldDuck) {
+      duckSharedVolume(TTS_DUCK_VOLUME);
+    } else {
+      restoreSharedVolume();
+    }
+  }, [transcribe.isListening, audioPlayer.isPlaying, wsStatus]);
 
   // VAD for visual feedback
   const checkVoiceActivity = useCallback(() => {

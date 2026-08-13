@@ -17,7 +17,16 @@ import { AudioCaptureManager } from "@/utils/audioUtils";
 import { createLogger } from "@/utils/logger";
 import { isWebSpeechSupported, useWebSpeechFallback } from "./useWebSpeechFallback";
 
+import { sanitizeTranscript, isLikelyHallucination } from "@/utils/sttTranscriptGuard";
+
 const log = createLogger("GoogleSTT");
+
+const RMS_SPEECH_THRESHOLD = parseFloat(process.env.NEXT_PUBLIC_STT_RMS_THRESHOLD || "0.012");
+const RMS_HANGOVER_MS = parseInt(process.env.NEXT_PUBLIC_STT_RMS_HANGOVER_MS || "900", 10);
+const DEFAULT_INTERIM_STABILITY_MS = parseInt(
+  process.env.NEXT_PUBLIC_STT_INTERIM_STABILITY_MS || "2500",
+  10
+);
 
 /**
  * Global STT Instance Manager
@@ -105,7 +114,7 @@ export function useGoogleSTT({
   onStop,
   inactivityTimeout = 0,        // Disabled by default — user clicks mic to stop
   stopOnTabHidden = true,
-  interimStabilityMs = 1500,    // 1.5 seconds — promote stable interim to final
+  interimStabilityMs = DEFAULT_INTERIM_STABILITY_MS,
 }: UseGoogleSTTOptions): UseGoogleSTTReturn {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -128,6 +137,28 @@ export function useGoogleSTT({
   // Interim stability detection refs
   const stabilityTimer = useRef<NodeJS.Timeout | null>(null);
   const lastInterimText = useRef<string>("");
+  const lastSpeechChunkMs = useRef(0);
+  const hadSpeechEnergyRef = useRef(false);
+
+  const emitTranscript = useCallback((text: string, isFinal: boolean) => {
+    const cleaned = sanitizeTranscript(text, isFinal, hadSpeechEnergyRef.current);
+    if (!cleaned) {
+      if (isFinal) {
+        log.debug(`🚫 Rejected final transcript (hallucination/noise): "${text}"`);
+      }
+      return false;
+    }
+
+    if (isFinal) {
+      setTranscript(cleaned);
+      setInterimTranscript("");
+      onTranscriptRef.current?.(cleaned, true);
+    } else {
+      setInterimTranscript(cleaned);
+      onTranscriptRef.current?.(cleaned, false);
+    }
+    return true;
+  }, []);
 
   // Keep refs updated
   useEffect(() => {
@@ -190,17 +221,30 @@ export function useGoogleSTT({
   const promoteInterimToFinal = useCallback((text: string) => {
     if (!text || !isListeningRef.current) return;
 
+    if (isLikelyHallucination(text, { isFinal: true, hadSpeechEnergy: hadSpeechEnergyRef.current })) {
+      log.debug(`🚫 Skipped interim→final promotion (hallucination): "${text}"`);
+      clearStabilityTimer();
+      lastInterimText.current = "";
+      return;
+    }
+
+    if (!hadSpeechEnergyRef.current) {
+      log.debug(`🚫 Skipped interim→final promotion (no speech energy): "${text}"`);
+      clearStabilityTimer();
+      lastInterimText.current = "";
+      return;
+    }
+
     log.debug(`⏱️ Interim stable for ${interimStabilityMs}ms → promoting to final: "${text}"`);
 
     // Clear stability state
     clearStabilityTimer();
     lastInterimText.current = "";
+    hadSpeechEnergyRef.current = false;
+    lastSpeechChunkMs.current = 0;
 
-    // Emit as final transcript
-    setTranscript(text);
-    setInterimTranscript("");
-    onTranscriptRef.current?.(text, true);
-  }, [interimStabilityMs, clearStabilityTimer]);
+    emitTranscript(text, true);
+  }, [interimStabilityMs, clearStabilityTimer, emitTranscript]);
 
   // ─── WebSocket message listener for STT responses ───
   useEffect(() => {
@@ -223,17 +267,11 @@ export function useGoogleSTT({
               resetInactivityTimer();
 
               if (isFinal) {
-                // Google sent a real final — use it directly
                 clearStabilityTimer();
                 lastInterimText.current = "";
-
-                setTranscript(text);
-                setInterimTranscript("");
-                onTranscriptRef.current?.(text, true);
+                emitTranscript(text, true);
               } else {
-                // Interim transcript — start/reset stability timer
-                setInterimTranscript(text);
-                onTranscriptRef.current?.(text, false);
+                if (!emitTranscript(text, false)) break;
 
                 // If text changed, reset the stability timer
                 if (text !== lastInterimText.current) {
@@ -243,7 +281,6 @@ export function useGoogleSTT({
                     promoteInterimToFinal(text);
                   }, interimStabilityMs);
                 }
-                // If text is the same, the existing timer continues counting
               }
             }
             break;
@@ -283,7 +320,7 @@ export function useGoogleSTT({
     return () => {
       ws.removeEventListener("message", handleMessage);
     };
-  }, [wsRef.current, interimStabilityMs, clearStabilityTimer, promoteInterimToFinal, fallbackToWebSpeech]);
+  }, [wsRef.current, interimStabilityMs, clearStabilityTimer, promoteInterimToFinal, fallbackToWebSpeech, emitTranscript]);
 
   // ─── Inactivity timer ───
   const resetInactivityTimer = useCallback(() => {
@@ -328,6 +365,8 @@ export function useGoogleSTT({
     }
     clearStabilityTimer();
     lastInterimText.current = "";
+    hadSpeechEnergyRef.current = false;
+    lastSpeechChunkMs.current = 0;
 
     // Stop audio capture
     if (audioCapture.current) {
@@ -403,6 +442,8 @@ export function useGoogleSTT({
       setTranscript("");
       setInterimTranscript("");
       lastInterimText.current = "";
+      hadSpeechEnergyRef.current = false;
+      lastSpeechChunkMs.current = 0;
       clearStabilityTimer();
 
       // Tell backend to start STT stream
@@ -419,17 +460,31 @@ export function useGoogleSTT({
         channelCount: 1,
       });
 
-      // Start audio capture - send chunks to backend via WebSocket
-      await audioCapture.current.start((audioData: Uint8Array) => {
+      // Start audio capture - send chunks to backend via WebSocket (VAD-gated)
+      await audioCapture.current.start((audioData: Uint8Array, rms: number) => {
         try {
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isListeningRef.current) {
-            // Send audio data as base64 JSON message
-            const base64Data = uint8ArrayToBase64(audioData);
-            wsRef.current.send(JSON.stringify({
-              type: "stt_audio",
-              data: base64Data,
-            }));
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !isListeningRef.current) {
+            return;
           }
+
+          const now = Date.now();
+          const isSpeech = rms >= RMS_SPEECH_THRESHOLD;
+          if (isSpeech) {
+            lastSpeechChunkMs.current = now;
+            hadSpeechEnergyRef.current = true;
+          }
+
+          const inHangover = now - lastSpeechChunkMs.current < RMS_HANGOVER_MS;
+          if (!isSpeech && !inHangover) {
+            return; // Skip silent chunks — reduces Whisper hallucination on noise
+          }
+
+          const base64Data = uint8ArrayToBase64(audioData);
+          wsRef.current.send(JSON.stringify({
+            type: "stt_audio",
+            data: base64Data,
+            rms,
+          }));
         } catch (err) {
           log.error("Error sending audio data:", err);
         }

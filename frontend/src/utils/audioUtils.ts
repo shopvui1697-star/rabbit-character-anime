@@ -148,8 +148,9 @@ export class AudioCaptureManager {
   private audioContext: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private processorNode: AudioWorkletNode | null = null;
+  private silentGainNode: GainNode | null = null;
   private rnnoiseNode: AudioWorkletNode | null = null;
-  private onAudioData: ((data: Uint8Array) => void) | null = null;
+  private onAudioData: ((data: Uint8Array, rms: number) => void) | null = null;
   private config: AudioCaptureConfig;
   private useRNNoise: boolean = ENABLE_RNNOISE; // Use global toggle
 
@@ -157,7 +158,7 @@ export class AudioCaptureManager {
     this.config = { ...DEFAULT_AUDIO_CONFIG, ...config };
   }
 
-  async start(onAudioData: (data: Uint8Array) => void): Promise<void> {
+  async start(onAudioData: (data: Uint8Array, rms: number) => void): Promise<void> {
     this.onAudioData = onAudioData;
 
     // Request microphone access
@@ -209,7 +210,8 @@ export class AudioCaptureManager {
     // Handle audio data from worklet
     this.processorNode.port.onmessage = (event) => {
       if (event.data.type === 'audioData') {
-        this.onAudioData?.(event.data.data);
+        const rms = typeof event.data.rms === 'number' ? event.data.rms : 0;
+        this.onAudioData?.(event.data.data, rms);
       }
     };
 
@@ -249,18 +251,24 @@ export class AudioCaptureManager {
       }
     }
 
-    // Connect audio pipeline
+    // Connect audio pipeline — route through silent gain (gain=0) to keep the
+    // graph alive WITHOUT playing mic audio through speakers (echo source).
+    this.silentGainNode = this.audioContext.createGain();
+    this.silentGainNode.gain.value = 0;
+
     if (rnnoiseEnabled && this.rnnoiseNode) {
-      // Pipeline: Mic → Source → RNNoise → AudioWorklet → Output
-      log.debug("🎵 Audio pipeline: Mic → RNNoise → AudioWorklet → AWS Transcribe");
+      // Pipeline: Mic → Source → RNNoise → AudioWorklet → SilentGain
+      log.debug("🎵 Audio pipeline: Mic → RNNoise → AudioWorklet (silent output)");
       this.source.connect(this.rnnoiseNode);
       this.rnnoiseNode.connect(this.processorNode);
-      this.processorNode.connect(this.audioContext.destination);
+      this.processorNode.connect(this.silentGainNode);
+      this.silentGainNode.connect(this.audioContext.destination);
     } else {
       // Fallback: Direct connection without RNNoise
-      log.debug("🎵 Audio pipeline: Mic → AudioWorklet → AWS Transcribe (no RNNoise)");
+      log.debug("🎵 Audio pipeline: Mic → AudioWorklet (silent output, no RNNoise)");
       this.source.connect(this.processorNode);
-      this.processorNode.connect(this.audioContext.destination);
+      this.processorNode.connect(this.silentGainNode);
+      this.silentGainNode.connect(this.audioContext.destination);
     }
 
     log.debug("🎤 Audio capture started:", {
@@ -287,6 +295,11 @@ export class AudioCaptureManager {
       this.processorNode.disconnect();
       this.processorNode = null;
       log.debug("🔇 AudioWorklet processor disconnected");
+    }
+
+    if (this.silentGainNode) {
+      this.silentGainNode.disconnect();
+      this.silentGainNode = null;
     }
 
     if (this.rnnoiseNode) {

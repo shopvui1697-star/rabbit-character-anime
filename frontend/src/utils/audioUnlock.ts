@@ -217,10 +217,52 @@ export function setupVisibilityHandler(): () => void {
   return () => document.removeEventListener("visibilitychange", handler);
 }
 
+let savedVolume = 1.0;
+let isDucked = false;
+
 /**
  * Set volume (0.0 to 1.0) on the shared GainNode.
  */
 export function setSharedVolume(volume: number): void {
+  const clamped = Math.max(0, Math.min(1, volume));
+  savedVolume = clamped;
   const gainNode = getSharedGainNode();
-  gainNode.gain.value = Math.max(0, Math.min(1, volume));
+  gainNode.gain.value = clamped;
+  isDucked = false;
+}
+
+/**
+ * Lower TTS volume while mic is active during AI speech — reduces echo pickup.
+ */
+export function duckSharedVolume(duckLevel: number, rampMs = 80): void {
+  const clamped = Math.max(0, Math.min(1, duckLevel));
+  const gainNode = getSharedGainNode();
+  const ctx = getSharedAudioContext();
+
+  if (!isDucked) {
+    savedVolume = gainNode.gain.value;
+    isDucked = true;
+  }
+
+  gainNode.gain.cancelScheduledValues(ctx.currentTime);
+  gainNode.gain.setValueAtTime(gainNode.gain.value, ctx.currentTime);
+  gainNode.gain.linearRampToValueAtTime(clamped, ctx.currentTime + rampMs / 1000);
+}
+
+/**
+ * Restore TTS volume after ducking.
+ */
+export function restoreSharedVolume(rampMs = 120): void {
+  if (!isDucked) return;
+
+  const gainNode = getSharedGainNode();
+  const ctx = getSharedAudioContext();
+  gainNode.gain.cancelScheduledValues(ctx.currentTime);
+  gainNode.gain.setValueAtTime(gainNode.gain.value, ctx.currentTime);
+  gainNode.gain.linearRampToValueAtTime(savedVolume, ctx.currentTime + rampMs / 1000);
+  isDucked = false;
+}
+
+export function isVolumeDucked(): boolean {
+  return isDucked;
 }

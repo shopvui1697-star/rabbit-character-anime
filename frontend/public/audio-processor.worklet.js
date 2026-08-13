@@ -108,6 +108,13 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
     // Convert to PCM16
     const pcm16 = this.convertFloat32ToPCM16(output);
 
+    // RMS for VAD gating on main thread
+    let sumSq = 0;
+    for (let i = 0; i < output.length; i++) {
+      sumSq += output[i] * output[i];
+    }
+    const rms = output.length > 0 ? Math.sqrt(sumSq / output.length) : 0;
+
     // Convert to Uint8Array (little-endian)
     const uint8Array = new Uint8Array(pcm16.length * 2);
     uint8Array.set(new Uint8Array(pcm16.buffer));
@@ -116,6 +123,7 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
     this.port.postMessage({
       type: 'audioData',
       data: uint8Array,
+      rms,
     }, [uint8Array.buffer]);
   }
 

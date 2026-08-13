@@ -5,6 +5,7 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { createLogger } from "@/utils/logger";
+import { sanitizeTranscript } from "@/utils/sttTranscriptGuard";
 
 const log = createLogger("WebSpeechFallback");
 
@@ -94,14 +95,21 @@ export function useWebSpeechFallback({
         }
 
         if (finalText) {
-          log.debug(`📝 Web Speech final: "${finalText}"`);
-          setTranscript(finalText);
+          const cleaned = sanitizeTranscript(finalText, true, true);
+          if (!cleaned) {
+            log.debug(`🚫 Web Speech final rejected (hallucination/noise): "${finalText}"`);
+            return;
+          }
+          log.debug(`📝 Web Speech final: "${cleaned}"`);
+          setTranscript(cleaned);
           setInterimTranscript("");
-          onTranscript?.(finalText, true);
+          onTranscript?.(cleaned, true);
         } else if (interimText) {
-          log.debug(`📝 Web Speech interim: "${interimText}"`);
-          setInterimTranscript(interimText);
-          onTranscript?.(interimText, false);
+          const cleaned = sanitizeTranscript(interimText, false, true);
+          if (!cleaned) return;
+          log.debug(`📝 Web Speech interim: "${cleaned}"`);
+          setInterimTranscript(cleaned);
+          onTranscript?.(cleaned, false);
         }
       };
 
