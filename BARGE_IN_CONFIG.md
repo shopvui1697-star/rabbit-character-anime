@@ -70,10 +70,10 @@ UI gợi ý: placeholder `"Speaking... (talk to interrupt)"` khi AI đang nói.
 sequenceDiagram
     participant User
     participant Mic as Browser Mic
+    participant Audio as useAudioPlayer
     participant FE as Frontend
     participant BE as Backend (WebSocket)
     participant STT as NineRouter STT (Groq Whisper)
-    participant Audio as useAudioPlayer
     participant LLM as Claude + TTS
 
     Note over BE,LLM: AI đang trả lời (responseId = R1)

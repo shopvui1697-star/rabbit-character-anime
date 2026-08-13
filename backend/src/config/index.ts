@@ -39,14 +39,14 @@ export const config = {
     modelId: process.env.AWS_BEDROCK_MODEL_ID || "anthropic.claude-haiku-4-5-20251001-v1:0",
   },
 
-  // PostgreSQL
+  // MySQL
   database: {
     host: process.env.DB_HOST || "localhost",
-    port: parseInt(process.env.DB_PORT || "5432", 10),
+    port: parseInt(process.env.DB_PORT || "3306", 10),
     database: process.env.DB_NAME || "rabbit_movies",
-    user: process.env.DB_USER || "postgres",
-    password: process.env.DB_PASSWORD || "postgres",
-    sslMode: process.env.DB_SSLMODE || "prefer",
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD || "",
+    ssl: process.env.DB_SSL === "true",
   },
 
   // Google Services (search only — TTS/STT use 9Router)

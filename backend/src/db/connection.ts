@@ -1,29 +1,45 @@
-import pg from "pg";
+import mysql from "mysql2/promise";
 import { config } from "../config/index.js";
 
-const { Pool } = pg;
-
-// Create connection pool with SSL support
-export const pool = new Pool({
+const rawPool = mysql.createPool({
   host: config.database.host,
   port: config.database.port,
   database: config.database.database,
   user: config.database.user,
   password: config.database.password,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-  ssl: config.database.sslMode === "require" || config.database.sslMode === "prefer"
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: config.database.ssl ? { rejectUnauthorized: false } : undefined,
+  waitForConnections: true,
+  connectionLimit: 10,
+  connectTimeout: 2000,
 });
+
+export interface QueryResult<T = any> {
+  rows: T[];
+  rowCount: number;
+}
+
+/**
+ * Thin adapter over mysql2's [rows, fields] tuple so call sites can keep using
+ * the `{ rows, rowCount }` shape (same as the previous `pg`-based pool).
+ */
+export const pool = {
+  async query<T = any>(sql: string, params?: readonly unknown[]): Promise<QueryResult<T>> {
+    const [result] = await rawPool.query(sql, params as any[]);
+    if (Array.isArray(result)) {
+      return { rows: result as T[], rowCount: result.length };
+    }
+    // INSERT/UPDATE/DELETE return a ResultSetHeader, not a row array
+    const header = result as mysql.ResultSetHeader;
+    return { rows: [] as T[], rowCount: header.affectedRows ?? 0 };
+  },
+};
 
 // Test connection
 export async function testConnection(): Promise<boolean> {
   try {
-    const client = await pool.connect();
-    await client.query("SELECT 1");
-    client.release();
+    const connection = await rawPool.getConnection();
+    await connection.query("SELECT 1");
+    connection.release();
     console.log("✅ Database connection successful");
     return true;
   } catch (error) {
@@ -34,6 +50,6 @@ export async function testConnection(): Promise<boolean> {
 
 // Graceful shutdown
 export async function closePool(): Promise<void> {
-  await pool.end();
+  await rawPool.end();
   console.log("Database pool closed");
 }

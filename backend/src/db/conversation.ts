@@ -19,7 +19,7 @@ export async function saveConversationTurn(
   try {
     await pool.query(
       `INSERT INTO conversation_history (session_id, user_id, user_name, user_token, role, content, domain, emotion)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [sessionId, userId || null, userName || null, userToken || null, turn.role, turn.content, domain, turn.emotion || null]
     );
   } catch (error) {
@@ -40,17 +40,17 @@ export async function getConversationHistory(
     let query = `
       SELECT id, session_id, user_id, user_name, user_token, role, content, domain, emotion, created_at
       FROM conversation_history
-      WHERE session_id = $1
+      WHERE session_id = ?
     `;
     const params: (string | number)[] = [sessionId];
 
     // Filter by domain if specified
     if (domain) {
-      query += ` AND domain = $2`;
+      query += ` AND domain = ?`;
       params.push(domain);
     }
 
-    query += ` ORDER BY created_at ASC LIMIT $${params.length + 1}`;
+    query += ` ORDER BY created_at ASC LIMIT ?`;
     params.push(limit);
 
     const result = await pool.query(query, params);
@@ -86,9 +86,9 @@ export async function getRecentHistoryByDomain(
     const result = await pool.query(
       `SELECT id, session_id, user_id, user_name, user_token, role, content, domain, emotion, created_at
        FROM conversation_history
-       WHERE domain = $1
+       WHERE domain = ?
        ORDER BY created_at DESC
-       LIMIT $2`,
+       LIMIT ?`,
       [domain, limit]
     );
     return result.rows;
@@ -105,7 +105,8 @@ export async function deleteOldHistory(daysOld: number = 30): Promise<number> {
   try {
     const result = await pool.query(
       `DELETE FROM conversation_history
-       WHERE created_at < NOW() - INTERVAL '${daysOld} days'`
+       WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+      [daysOld]
     );
     return result.rowCount || 0;
   } catch (error) {
@@ -157,17 +158,17 @@ export async function getConversationHistoryByUserId(
     let query = `
       SELECT id, session_id, user_id, user_name, user_token, role, content, domain, emotion, created_at
       FROM conversation_history
-      WHERE user_id = $1
+      WHERE user_id = ?
     `;
     const params: (string | number)[] = [userId];
 
     // Filter by domain if specified
     if (domain) {
-      query += ` AND domain = $2`;
+      query += ` AND domain = ?`;
       params.push(domain);
     }
 
-    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    query += ` ORDER BY created_at DESC LIMIT ?`;
     params.push(limit);
 
     const result = await pool.query(query, params);

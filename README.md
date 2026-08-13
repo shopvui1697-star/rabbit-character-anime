@@ -14,7 +14,7 @@
 - **感情表現**: Lottieアニメーションで感情を表現
 - **音声出力**: Azure Neural TTSによる感情豊かな音声合成
 - **映画検索**: データベースから映画情報を検索して回答
-- **会話履歴**: PostgreSQLに会話を保存し、ドメイン別(movie/gourmet/general)にコンテキスト管理
+- **会話履歴**: MySQLに会話を保存し、ドメイン別(movie/gourmet/general)にコンテキスト管理
 - **ユーザー認証**: トークンベースの認証とパーソナライズされた会話
 - **ユーザーアーカイブ**: 映画やグルメ情報を個人アーカイブに保存 (NEW!)
 - **リアルタイム**: WebSocketによる低遅延通信
@@ -46,8 +46,8 @@
 │  └──────┬──────┘  └──────────────────────┘                 │
 │         │                                                    │
 │  ┌──────▼───────────┐                                       │
-│  │ PostgreSQL       │                                       │
-│  │ (Movies DB)      │                                       │
+│  │ MySQL            │                                       │
+│  │ (User/History)   │                                       │
 │  └──────────────────┘                                       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -79,7 +79,7 @@
 ## 📋 必要条件
 
 - Node.js 18+
-- PostgreSQL 14+ (Docker推奨)
+- MySQL 8+ (既存サーバーに接続 — ローカルDockerコンテナは不要)
 - 以下のAPIキー:
   - **AWS Credentials** (Transcribe用、**必須** - 音声入力に使用)
   - Anthropic API Key (Claude)
@@ -121,13 +121,13 @@ ANTHROPIC_API_KEY=your_anthropic_api_key
 AZURE_SPEECH_KEY=your_azure_speech_key
 AZURE_SPEECH_REGION=japaneast
 
-# PostgreSQL Database
+# MySQL Database (既存サーバー)
 DB_HOST=localhost
-DB_PORT=5432
+DB_PORT=3306
 DB_NAME=rabbit_movies
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_SSLMODE=prefer
+DB_USER=root
+DB_PASSWORD=
+DB_SSL=false
 ```
 
 #### フロントエンド (AWS Transcribe用)
@@ -183,27 +183,12 @@ docker-compose up -d
 npm run db:setup
 ```
 
-このコマンドで以下が作成されます:
-- `movies` テーブル: 映画情報データベース
+このコマンドで以下が作成されます（MySQL、既に存在する場合はスキップされます):
 - `conversation_history` テーブル: 会話履歴（ドメイン付き）
 - `user_profile` テーブル: ユーザープロフィール
 - `user_archive` テーブル: ユーザーアーカイブ（映画・グルメ保存機能）
 
-既存のデータベースにテーブルを追加する場合:
-
-```bash
-# 会話履歴テーブルの追加
-npm run db:migrate
-
-# ユーザーアーカイブテーブルの追加
-npm run db:migrate-archive
-```
-
-ユーザープロフィールデータをインポート:
-
-```bash
-npm run db:import-users
-```
+映画・レストラン検索は外部OpenSearch APIを使用するため、ローカルDBにテーブルはありません。
 
 ### 6. 開発サーバーの起動
 
@@ -237,7 +222,7 @@ rabbit/
 │   │   └── index.ts         # エントリーポイント
 │   └── package.json
 │
-├── docker-compose.yml        # PostgreSQL
+├── docker-compose.yml        # backend/frontend (MySQLは既存サーバーに接続)
 ├── package.json             # ルートパッケージ
 └── README.md
 ```
@@ -312,11 +297,11 @@ GET /api/archive/:userId/:domain/:itemId
 | Avatar | Lottie Animations |
 | Frontend | Next.js 15, React 18, TypeScript |
 | Backend | Node.js, Express, WebSocket |
-| Database | PostgreSQL |
+| Database | MySQL |
 
 ## 💾 会話履歴とドメイン管理
 
-会話履歴は自動的にPostgreSQLデータベースに保存され、ドメイン別にコンテキストが管理されます。
+会話履歴は自動的にMySQLデータベースに保存され、ドメイン別にコンテキストが管理されます。
 
 ### ドメインタイプ
 
@@ -542,12 +527,14 @@ ws.send(JSON.stringify({
 
 ### データベースに接続できない
 
-```bash
-# PostgreSQL コンテナが起動しているか確認
-docker-compose ps
+MySQLは既存サーバーに接続する構成のため、ローカルDBコンテナはありません。`backend/.env` の `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` が正しいか確認してください。
 
-# 起動していない場合
-docker-compose up -d
+```bash
+# MySQLサーバーへの接続確認
+mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p
+
+# テーブル作成 (初回のみ)
+npm run db:setup
 ```
 
 ### 音声が再生されない

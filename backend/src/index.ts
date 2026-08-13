@@ -223,8 +223,8 @@ async function start() {
   // Test database connection
   const dbConnected = await testConnection();
   if (!dbConnected) {
-    logger.warn("Database not available. Movie search will return empty results.");
-    logger.warn("Run 'npm run db:setup' after setting up PostgreSQL.");
+    logger.warn("Database not available. User profile, conversation history, and archive will not work.");
+    logger.warn("Run 'npm run db:setup' after setting up MySQL.");
   }
 
   // Start HTTP server

@@ -12,7 +12,6 @@
     "build:frontend": "cd frontend && npm run build",
     "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
     "db:setup": "cd backend && npm run db:setup",
-    "db:migrate-archive": "cd backend && npm run db:migrate-archive",
     "generate-waiting": "cd backend && npm run generate-waiting",
     "generate:short-waiting": "cd backend && npm run generate:short-waiting",
     "generate-all-waiting": "cd backend && npm run generate-all-waiting"

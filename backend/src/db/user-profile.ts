@@ -50,9 +50,9 @@ export interface UserContext {
 export async function getRandomUser(): Promise<UserProfile | null> {
   try {
     const result = await pool.query(
-      `SELECT * FROM user_profile 
-       WHERE deleted_at IS NULL 
-       ORDER BY RANDOM() 
+      `SELECT * FROM user_profile
+       WHERE deleted_at IS NULL
+       ORDER BY RAND()
        LIMIT 1`
     );
 

@@ -25,15 +25,20 @@ export async function saveToArchive(
   itemData?: Record<string, unknown>
 ): Promise<UserArchive> {
   try {
-    const result = await pool.query(
+    // MySQL has no RETURNING clause — upsert, then re-select the row by its unique key
+    await pool.query(
       `INSERT INTO user_archive (user_id, domain, item_id, item_title, item_data)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (user_id, domain, item_id) DO UPDATE
-       SET item_title = EXCLUDED.item_title,
-           item_data = EXCLUDED.item_data,
-           created_at = CURRENT_TIMESTAMP
-       RETURNING *`,
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         item_title = VALUES(item_title),
+         item_data = VALUES(item_data),
+         created_at = CURRENT_TIMESTAMP`,
       [userId, domain, itemId, itemTitle || null, itemData ? JSON.stringify(itemData) : null]
+    );
+
+    const result = await pool.query<UserArchive>(
+      `SELECT * FROM user_archive WHERE user_id = ? AND domain = ? AND item_id = ?`,
+      [userId, domain, itemId]
     );
 
     return result.rows[0];
@@ -54,7 +59,7 @@ export async function removeFromArchive(
   try {
     const result = await pool.query(
       `DELETE FROM user_archive
-       WHERE user_id = $1 AND domain = $2 AND item_id = $3`,
+       WHERE user_id = ? AND domain = ? AND item_id = ?`,
       [userId, domain, itemId]
     );
 
@@ -77,17 +82,17 @@ export async function getArchiveByDomain(
     let query = `
       SELECT id, user_id, domain, item_id, item_title, item_data, created_at
       FROM user_archive
-      WHERE user_id = $1
+      WHERE user_id = ?
     `;
     const params: (string | number)[] = [userId];
 
     // Filter by domain if specified
     if (domain) {
-      query += ` AND domain = $2`;
+      query += ` AND domain = ?`;
       params.push(domain);
     }
 
-    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    query += ` ORDER BY created_at DESC LIMIT ?`;
     params.push(limit);
 
     const result = await pool.query(query, params);
@@ -109,7 +114,7 @@ export async function isInArchive(
   try {
     const result = await pool.query(
       `SELECT 1 FROM user_archive
-       WHERE user_id = $1 AND domain = $2 AND item_id = $3
+       WHERE user_id = ? AND domain = ? AND item_id = ?
        LIMIT 1`,
       [userId, domain, itemId]
     );
@@ -131,7 +136,7 @@ export async function getArchiveStats(userId: string): Promise<{
     const result = await pool.query(
       `SELECT domain, COUNT(*) as count
        FROM user_archive
-       WHERE user_id = $1
+       WHERE user_id = ?
        GROUP BY domain
        ORDER BY count DESC`,
       [userId]
@@ -167,14 +172,14 @@ export async function getFriendsWhoSavedItem(
 ): Promise<FriendMatch[]> {
   try {
     const result = await pool.query(
-      `SELECT DISTINCT 
+      `SELECT DISTINCT
          ua.user_id as id,
-         COALESCE(up.nick_name, up.name, 'User ' || ua.user_id) as name
+         COALESCE(up.nick_name, up.name, CONCAT('User ', ua.user_id)) as name
        FROM user_archive ua
-       LEFT JOIN user_profile up ON ua.user_id::integer = up.users_id
-       WHERE ua.domain = $1 
-         AND ua.item_id = $2 
-         AND ua.user_id != $3
+       LEFT JOIN user_profile up ON CAST(ua.user_id AS SIGNED) = up.users_id
+       WHERE ua.domain = ?
+         AND ua.item_id = ?
+         AND ua.user_id != ?
        ORDER BY name`,
       [domain, itemId, userId]
     );
