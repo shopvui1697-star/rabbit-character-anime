@@ -1,10 +1,5 @@
 /**
- * Echo / self-barge-in protection for voice interrupt.
- *
- * Layers:
- * 1. Cooldown after TTS playback starts (speaker → mic delay)
- * 2. Higher character threshold while AI is speaking
- * 3. Content filter — reject transcript that matches recent TTS output
+ * Echo protection — matches transcript against actual TTS content spoken (not phrase blocklists).
  */
 
 import { createLogger } from "@/utils/logger";
@@ -16,37 +11,54 @@ const SPEAKING_MIN_CHARS = parseInt(
   process.env.NEXT_PUBLIC_BARGE_IN_SPEAKING_MIN_CHARS || "4",
   10
 );
-const MAX_TTS_HISTORY = 8;
+const MAX_TTS_HISTORY = 24;
+const MIN_ECHO_SUBSTRING_LEN = 16;
+const TTS_HISTORY_TTL_MS = parseInt(process.env.NEXT_PUBLIC_ECHO_HISTORY_TTL_MS || "8000", 10);
 
 let lastTtsPlaybackStartMs = 0;
+let historyClearTimer: ReturnType<typeof setTimeout> | null = null;
 const recentTtsTexts: string[] = [];
 
-/** Call when TTS audio begins playing (each chunk). */
-export function notifyTtsPlaybackStarted(): void {
-  lastTtsPlaybackStartMs = Date.now();
-}
-
-/** Track sentences the AI is speaking (for echo matching). */
-export function registerTtsContent(text: string): void {
-  const trimmed = text.trim();
-  if (!trimmed) return;
-
-  recentTtsTexts.push(trimmed);
-  if (recentTtsTexts.length > MAX_TTS_HISTORY) {
-    recentTtsTexts.shift();
+function cancelHistoryClear(): void {
+  if (historyClearTimer) {
+    clearTimeout(historyClearTimer);
+    historyClearTimer = null;
   }
 }
 
-/** Clear TTS history when a response is cancelled or a new turn begins. */
+function scheduleHistoryClear(): void {
+  cancelHistoryClear();
+  historyClearTimer = setTimeout(() => {
+    recentTtsTexts.length = 0;
+    historyClearTimer = null;
+  }, TTS_HISTORY_TTL_MS);
+}
+
+export function notifyTtsPlaybackStarted(): void {
+  lastTtsPlaybackStartMs = Date.now();
+  cancelHistoryClear();
+}
+
+export function notifyTtsPlaybackEnded(): void {
+  scheduleHistoryClear();
+}
+
+export function registerTtsContent(text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  cancelHistoryClear();
+  recentTtsTexts.push(trimmed);
+  if (recentTtsTexts.length > MAX_TTS_HISTORY) recentTtsTexts.shift();
+}
+
 export function clearTtsContent(): void {
+  cancelHistoryClear();
   recentTtsTexts.length = 0;
   lastTtsPlaybackStartMs = 0;
 }
 
-function normalize(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[\s\p{P}\p{S}]/gu, "");
+export function normalizeTranscript(text: string): string {
+  return text.toLowerCase().replace(/[\s\p{P}\p{S}]/gu, "");
 }
 
 function wordTokens(text: string): string[] {
@@ -56,46 +68,58 @@ function wordTokens(text: string): string[] {
     .filter((w) => w.length > 1);
 }
 
-/**
- * Returns true if transcript likely comes from speaker echo of TTS output.
- */
+/** True when transcript matches recent TTS output (acoustic echo transcribed by Whisper). */
 export function isLikelyEcho(transcript: string): boolean {
-  const norm = normalize(transcript);
+  if (recentTtsTexts.length === 0) return false;
+
+  const norm = normalizeTranscript(transcript);
   if (norm.length < 2) return false;
 
+  const combined = recentTtsTexts.join(" ");
+  const normCombined = normalizeTranscript(combined);
+
+  if (norm.length >= MIN_ECHO_SUBSTRING_LEN && normCombined.includes(norm)) {
+    log.debug(`Echo filter: combined substring "${transcript}"`);
+    return true;
+  }
+
+  const tWords = wordTokens(transcript);
+  if (tWords.length >= 3) {
+    const combinedWords = new Set(wordTokens(combined));
+    const overlap = tWords.filter((w) => combinedWords.has(w)).length;
+    if (overlap / tWords.length >= 0.5) {
+      log.debug(`Echo filter: overlap ${overlap}/${tWords.length} "${transcript}"`);
+      return true;
+    }
+  }
+
   for (const ttsText of recentTtsTexts) {
-    const normTts = normalize(ttsText);
+    const normTts = normalizeTranscript(ttsText);
     if (!normTts) continue;
-
-    // Direct substring match (STT often picks up partial TTS phrases)
-    if (normTts.includes(norm) || norm.includes(normTts)) {
-      log.debug(`Echo filter: substring match "${transcript}" ↔ TTS`);
-      return true;
-    }
-
-    // Prefix match — echo often starts at beginning of current sentence
-    const prefixLen = Math.min(norm.length, normTts.length, 12);
-    if (prefixLen >= 4 && norm.slice(0, prefixLen) === normTts.slice(0, prefixLen)) {
-      log.debug(`Echo filter: prefix match "${transcript}" ↔ TTS`);
-      return true;
-    }
-
-    // Word overlap — >60% of transcript words appear in TTS sentence
-    const tWords = wordTokens(transcript);
-    if (tWords.length >= 2) {
-      const ttsWords = new Set(wordTokens(ttsText));
-      const overlap = tWords.filter((w) => ttsWords.has(w)).length;
-      if (overlap / tWords.length >= 0.6) {
-        log.debug(`Echo filter: word overlap ${overlap}/${tWords.length} "${transcript}"`);
-        return true;
-      }
-    }
+    if (normTts.length >= 12 && norm.includes(normTts)) return true;
+    if (norm.length >= MIN_ECHO_SUBSTRING_LEN && normTts.includes(norm)) return true;
+    const prefixLen = Math.min(norm.length, normTts.length, 16);
+    if (prefixLen >= 10 && norm.slice(0, prefixLen) === normTts.slice(0, prefixLen)) return true;
   }
 
   return false;
 }
 
-function isInCooldown(): boolean {
+export function isRepeatSubmission(previous: string, next: string): boolean {
+  const a = normalizeTranscript(previous);
+  const b = normalizeTranscript(next);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length >= 4 && longer.startsWith(shorter)) {
+    const extra = (longer.length - shorter.length) / longer.length;
+    if (extra <= 0.25) return true;
+  }
+  return false;
+}
+
+export function isInTtsCooldown(): boolean {
   if (lastTtsPlaybackStartMs === 0) return false;
   return Date.now() - lastTtsPlaybackStartMs < COOLDOWN_MS;
 }
@@ -112,10 +136,6 @@ export interface BargeInCheckResult {
   reason?: "cooldown" | "min_chars" | "echo";
 }
 
-/**
- * Decide whether to act on a transcript for barge-in.
- * Used for both early (stop audio) and final (submit message) paths.
- */
 export function checkBargeIn({
   text,
   isFinal,
@@ -129,19 +149,12 @@ export function checkBargeIn({
     return { allowed: false, reason: "echo" };
   }
 
-  if (!aiSpeaking) {
-    return { allowed: true };
-  }
+  if (!aiSpeaking) return { allowed: true };
 
-  // While AI is speaking, require more chars for early barge-in
   if (!isFinal) {
     const minChars = Math.max(earlyMinChars, SPEAKING_MIN_CHARS);
-    if (trimmed.length < minChars) {
-      return { allowed: false, reason: "min_chars" };
-    }
-    if (isInCooldown()) {
-      return { allowed: false, reason: "cooldown" };
-    }
+    if (trimmed.length < minChars) return { allowed: false, reason: "min_chars" };
+    if (isInTtsCooldown()) return { allowed: false, reason: "cooldown" };
   }
 
   return { allowed: true };

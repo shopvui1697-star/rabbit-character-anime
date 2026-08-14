@@ -41,6 +41,9 @@ class EchoCanceller {
     this.estimatedDelay = Math.round(0.04 * sampleRate); // 40ms initial guess, refined by search
     this.couplingStrength = 0; // 0..1, normalized correlation at the estimated delay
     this.minCouplingToFilter = 0.15;
+    this.lastRefRms = 0;
+    this.lastResidualRms = 0;
+    this.bargeInUntil = 0;
 
     this.weights = new Float32Array(this.tapCount);
     this.avgEnergy = 0; // running average of tap-window energy, for the silence gate below
@@ -62,6 +65,17 @@ class EchoCanceller {
 
   setConfig(config) {
     if (typeof config.enabled === "boolean") this.enabled = config.enabled;
+  }
+
+  /** User interrupted TTS — relax VAD and stop chasing stale reference. */
+  enterBargeInMode(currentTime, durationSec = 3) {
+    this.bargeInUntil = currentTime + durationSec;
+    this.pendingChunks = [];
+    this.couplingStrength *= 0.25;
+  }
+
+  clearPendingReference() {
+    this.pendingChunks = [];
   }
 
   /** Queue a chunk of reference (TTS) audio that started playing at `startTime` (this processor's currentTime domain). */
@@ -170,12 +184,24 @@ class EchoCanceller {
   cancelEcho(rawAudio, currentTime) {
     this.ingestPending(currentTime);
 
-    if (!this.enabled) return rawAudio;
+    if (!this.enabled) {
+      this.lastRefRms = 0;
+      this.lastResidualRms = this.computeRms(rawAudio);
+      return rawAudio;
+    }
 
     this.maybeEstimateDelay(rawAudio);
 
-    if (this.refTotalWritten < this.tapCount + this.maxDelaySamples) return rawAudio;
-    if (this.couplingStrength < this.minCouplingToFilter) return rawAudio;
+    if (this.refTotalWritten < this.tapCount + this.maxDelaySamples) {
+      this.lastRefRms = 0;
+      this.lastResidualRms = this.computeRms(rawAudio);
+      return rawAudio;
+    }
+    if (this.couplingStrength < this.minCouplingToFilter) {
+      this.lastRefRms = 0;
+      this.lastResidualRms = this.computeRms(rawAudio);
+      return rawAudio;
+    }
 
     const output = new Float32Array(rawAudio.length);
     const nowRefIndex = this.refTotalWritten - 1;
@@ -230,7 +256,56 @@ class EchoCanceller {
       // skip adaptation this sample rather than risk a noise-driven weight spike.
     }
 
+    this.lastRefRms = this.computeRefWindowRms(baseRefIndex, rawAudio.length);
+    this.lastResidualRms = this.computeRms(output);
     return output;
+  }
+
+  computeRms(samples) {
+    if (!samples || samples.length === 0) return 0;
+    let sumSq = 0;
+    for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+    return Math.sqrt(sumSq / samples.length);
+  }
+
+  /** RMS of reference signal aligned to the mic window just processed. */
+  computeRefWindowRms(baseRefIndex, length) {
+    let sumSq = 0;
+    for (let n = 0; n < length; n++) {
+      const refIdx0 = baseRefIndex + n;
+      for (let k = 0; k < this.tapCount; k++) {
+        const r = this.refAt(refIdx0 - k);
+        sumSq += r * r;
+      }
+    }
+    const denom = Math.max(1, length * this.tapCount);
+    return Math.sqrt(sumSq / denom);
+  }
+
+  /**
+   * Post-AEC VAD: strict when idle (no TTS); relaxed during TTS overlay / barge-in window.
+   * Never return true on noise floor alone — Whisper hallucinates on mic hiss at session start.
+   */
+  isSpeechLikely(residualRms, currentTime) {
+    const IDLE_SPEECH_RMS = 0.015;
+    const OVERLAY_ABS_RMS = 0.016;
+    const BARGEIN_RATIO = 0.08;
+    const OVERLAY_RATIO = 0.12;
+
+    if (this.bargeInUntil > currentTime) {
+      if (residualRms >= OVERLAY_ABS_RMS) return true;
+      if (this.lastRefRms >= 0.005 && residualRms > this.lastRefRms * BARGEIN_RATIO) return true;
+      return false;
+    }
+
+    // No TTS reference — strict idle gate (mic AGC / room noise must not trigger STT)
+    if (this.lastRefRms < 1e-5) {
+      return residualRms >= IDLE_SPEECH_RMS;
+    }
+
+    // TTS reference active — detect user talking over playback (barge-in)
+    if (residualRms >= OVERLAY_ABS_RMS) return true;
+    return residualRms > this.lastRefRms * OVERLAY_RATIO;
   }
 }
 
@@ -271,6 +346,10 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
         this.echoCanceller.setConfig(msg);
       } else if (msg.type === "referenceAudio") {
         this.echoCanceller.addReferenceChunk(msg.data, msg.startTime);
+      } else if (msg.type === "bargeInActive") {
+        this.echoCanceller.enterBargeInMode(currentTime, msg.durationSec || 3);
+      } else if (msg.type === "clearReference") {
+        this.echoCanceller.clearPendingReference();
       }
     };
   }
@@ -360,6 +439,7 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
       sumSq += output[i] * output[i];
     }
     const rms = output.length > 0 ? Math.sqrt(sumSq / output.length) : 0;
+    const speechLikely = this.echoCanceller.isSpeechLikely(rms, currentTime);
 
     // Convert to Uint8Array (little-endian)
     const uint8Array = new Uint8Array(pcm16.length * 2);
@@ -370,6 +450,7 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
       type: 'audioData',
       data: uint8Array,
       rms,
+      speechLikely,
       couplingStrength: this.echoCanceller.couplingStrength,
     }, [uint8Array.buffer]);
   }

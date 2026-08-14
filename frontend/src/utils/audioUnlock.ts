@@ -19,7 +19,14 @@ const waitingBufferCache = new Map<number, AudioBuffer>();
  * inside `source.start(0)`, so subscribers can stamp their own AudioContext's
  * `currentTime` at that exact instant to align the reference on their own clock.
  */
-type PlaybackReferenceListener = (samples: Float32Array, sampleRate: number) => void;
+type PlaybackReferenceListener = (
+  samples: Float32Array,
+  sampleRate: number,
+  /** Shared AudioContext time when playback starts — AEC reference alignment. */
+  startTime: number,
+  /** Effective output gain at playback start (ducking included). */
+  gain: number
+) => void;
 const referenceListeners = new Set<PlaybackReferenceListener>();
 
 /** Subscribe to raw TTS playback audio for echo-cancellation reference. Returns an unsubscribe fn. */
@@ -30,10 +37,13 @@ export function onPlaybackReference(listener: PlaybackReferenceListener): () => 
 
 function publishPlaybackReference(buffer: AudioBuffer): void {
   if (referenceListeners.size === 0) return;
-  // Mono reference is enough for echo cancellation — first channel only.
+  const ctx = getSharedAudioContext();
+  const gainNode = getSharedGainNode();
+  const startTime = ctx.currentTime;
+  const gain = gainNode.gain.value;
   const samples = buffer.getChannelData(0);
   for (const listener of referenceListeners) {
-    listener(samples, buffer.sampleRate);
+    listener(samples, buffer.sampleRate, startTime, gain);
   }
 }
 

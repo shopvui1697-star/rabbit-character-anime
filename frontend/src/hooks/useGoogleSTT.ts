@@ -1,15 +1,10 @@
 /**
- * Google Cloud STT hook - Streams audio via backend WebSocket
- * 
- * Handles real-time speech-to-text using Google Cloud Speech-to-Text.
- * Audio is captured in the browser, sent to the backend via WebSocket,
- * and the backend streams it to Google Cloud STT and returns transcripts.
- * 
- * Includes "interim stability" detection: if an interim transcript stays
- * unchanged for a configurable period, it is promoted to a final transcript.
- * This replaces AWS Transcribe's built-in PartialResultsStability feature.
- * 
- * Provides the same interface as useAWSTranscribe for easy migration.
+ * STT hook — streams mic PCM to backend (NineRouter / Groq Whisper).
+ *
+ * Standard pipeline:
+ *   Mic → shared AudioContext → NLMS AEC (TTS reference, same clock) → PCM stream
+ *   Post-AEC VAD (worklet speechLikely) → UI + endpoint (stt_commit)
+ *   Backend Whisper → transcripts
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
@@ -17,102 +12,51 @@ import { AudioCaptureManager } from "@/utils/audioUtils";
 import { createLogger } from "@/utils/logger";
 import { isWebSpeechSupported, useWebSpeechFallback } from "./useWebSpeechFallback";
 
-import { sanitizeTranscript, isLikelyHallucination } from "@/utils/sttTranscriptGuard";
-
 const log = createLogger("GoogleSTT");
 
-const RMS_SPEECH_THRESHOLD = parseFloat(process.env.NEXT_PUBLIC_STT_RMS_THRESHOLD || "0.012");
-const RMS_HANGOVER_MS = parseInt(process.env.NEXT_PUBLIC_STT_RMS_HANGOVER_MS || "900", 10);
-const DEFAULT_INTERIM_STABILITY_MS = parseInt(
-  process.env.NEXT_PUBLIC_STT_INTERIM_STABILITY_MS || "2500",
-  10
-);
+const VAD_RELEASE_MS = 300;
+const ENDPOINT_SILENCE_MS = 400;
+/** Ignore VAD for mic/AGC settle after capture starts. */
+const MIC_WARMUP_MS = 800;
+/** Brief pauses between syllables must not reset the utterance. */
+const SPEECH_GAP_HOLD_MS = 400;
+/** Require sustained speech before marking utterance (blocks single noise blips → Whisper hallucination). */
+const SPEECH_SUSTAIN_MS = 100;
 
-// Fast VAD (voice activity detection) duration-guard — confirms real speech from raw mic RMS
-// well before any STT transcript arrives. Reuses RMS_SPEECH_THRESHOLD above as the energy gate.
-const VAD_CONFIRM_MS = parseInt(process.env.NEXT_PUBLIC_VAD_CONFIRM_MS || "200", 10);
-const VAD_RELEASE_MS = parseInt(process.env.NEXT_PUBLIC_VAD_RELEASE_MS || "200", 10);
-
-// Adaptive noise-floor threshold: RMS_SPEECH_THRESHOLD above is now a MINIMUM floor,
-// not the sole cutoff. During confirmed non-speech we track an EMA of the room's noise
-// level, and require RMS to clear (noise floor * multiplier) to count as speech — this
-// tracks the mic input AFTER echo cancellation (see AudioCaptureManager), so residual
-// echo that leaks through also gets absorbed into "ambient noise" rather than
-// repeatedly tripping VAD at a fixed threshold that has to be hand-tuned per environment.
-const VAD_NOISE_FLOOR_ALPHA = parseFloat(process.env.NEXT_PUBLIC_VAD_NOISE_FLOOR_ALPHA || "0.05");
-const VAD_ADAPTIVE_MULTIPLIER = parseFloat(process.env.NEXT_PUBLIC_VAD_ADAPTIVE_MULTIPLIER || "3.0");
-
-/**
- * Global STT Instance Manager
- * Ensures only one STT session is active at a time
- */
 class STTInstanceManager {
-  private static activeInstance: {
-    stopListening: () => void;
-    id: string;
-  } | null = null;
+  private static activeInstance: { stopListening: () => void; id: string } | null = null;
 
   static register(stopListening: () => void, id: string): void {
     if (this.activeInstance && this.activeInstance.id !== id) {
-      log.debug(`🔄 Stopping previous STT instance (${this.activeInstance.id})`);
       this.activeInstance.stopListening();
     }
     this.activeInstance = { stopListening, id };
-    log.debug(`✅ Registered STT instance: ${id}`);
   }
 
   static unregister(id: string): void {
-    if (this.activeInstance?.id === id) {
-      log.debug(`🗑️ Unregistered STT instance: ${id}`);
-      this.activeInstance = null;
-    }
+    if (this.activeInstance?.id === id) this.activeInstance = null;
   }
 }
 
 export interface GoogleSTTConfig {
-  languageCode: string;   // e.g. "ja-JP"
-  sampleRate: number;     // e.g. 16000
-  model?: string;         // e.g. "default", "latest_long"
+  languageCode: string;
+  sampleRate: number;
+  model?: string;
 }
 
 export interface UseGoogleSTTOptions {
   config: GoogleSTTConfig;
-  /** Reference to the app WebSocket */
   wsRef: React.RefObject<WebSocket | null>;
-  /** Whether the WebSocket is connected */
   wsConnected: boolean;
   onTranscript?: (text: string, isFinal: boolean) => void;
   onError?: (error: Error) => void;
   onStart?: () => void;
   onStop?: () => void;
-  /**
-   * Fast, duration-guarded voice-activity signal computed from raw mic RMS —
-   * fires ~VAD_CONFIRM_MS after real speech energy starts, well before any STT
-   * transcript arrives. Not available when running on the Web Speech fallback
-   * (no raw audio access there).
-   */
   onVoiceActivity?: (active: boolean) => void;
-  /**
-   * Fast Web Speech-derived signal used only to accelerate barge-in detection
-   * (duck/early-stop) while NineRouter/Groq is healthy — Web Speech is NOT
-   * authoritative in this mode; NineRouter's own transcript still drives final
-   * submission via `onTranscript`. Runs in parallel with the NineRouter mic
-   * capture (when the browser supports it). Web Speech only becomes
-   * authoritative in the exclusive-fallback path (routed through `onTranscript`).
-   */
-  onFastSignal?: (text: string, isFinal: boolean) => void;
-  /**
-   * Acoustic echo coupling strength (0..1), reported by the NLMS echo canceller
-   * roughly 2x/sec while it has a confident delay lock. High values mean strong
-   * speaker→mic coupling (e.g. laptop built-in speaker); near-zero means little
-   * to no coupling (e.g. headphones — nothing to echo-cancel or duck against).
-   */
-  onEchoCoupling?: (strength: number) => void;
-  // Auto-stop configuration
-  inactivityTimeout?: number;     // ms of silence before auto-stop (0 = disabled, default: 0)
-  stopOnTabHidden?: boolean;      // Stop when tab hidden (default: true)
-  // Interim stability: promote unchanged interim to final after this delay (ms)
-  interimStabilityMs?: number;    // default: 1500 (1.5 seconds)
+  /** Returns true while TTS audio is playing — enables barge-in VAD mode. */
+  isTtsPlaying?: () => boolean;
+  inactivityTimeout?: number;
+  stopOnTabHidden?: boolean;
 }
 
 export interface UseGoogleSTTReturn {
@@ -121,12 +65,11 @@ export interface UseGoogleSTTReturn {
   interimTranscript: string;
   startListening: () => Promise<void>;
   stopListening: () => void;
+  discardUtterance: () => void;
+  enterBargeInMode: () => void;
   error: Error | null;
 }
 
-/**
- * Helper: Convert Uint8Array to base64 string
- */
 function isBackendSttSetupError(message: string): boolean {
   return /no stt credentials|no credentials for provider|invalid api key|gsk_|organization id|groq stt authentication|add .* api key/i.test(
     message
@@ -135,26 +78,25 @@ function isBackendSttSetupError(message: string): boolean {
 
 function uint8ArrayToBase64(data: Uint8Array): string {
   let binary = "";
-  for (let i = 0; i < data.length; i++) {
-    binary += String.fromCharCode(data[i]);
-  }
+  for (let i = 0; i < data.length; i++) binary += String.fromCharCode(data[i]);
   return btoa(binary);
+}
+
+function trimTranscript(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
 }
 
 export function useGoogleSTT({
   config,
   wsRef,
-  wsConnected,
   onTranscript,
   onError,
   onStart,
   onStop,
   onVoiceActivity,
-  onFastSignal,
-  onEchoCoupling,
-  inactivityTimeout = 0,        // Disabled by default — user clicks mic to stop
+  isTtsPlaying,
+  inactivityTimeout = 0,
   stopOnTabHidden = true,
-  interimStabilityMs = DEFAULT_INTERIM_STABILITY_MS,
 }: UseGoogleSTTOptions): UseGoogleSTTReturn {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -164,114 +106,113 @@ export function useGoogleSTT({
 
   const audioCapture = useRef<AudioCaptureManager | null>(null);
   const inactivityTimer = useRef<NodeJS.Timeout | null>(null);
-  const instanceId = useRef<string>(`google-stt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`);
+  const instanceId = useRef(`google-stt-${Date.now()}`);
   const isListeningRef = useRef(false);
   const usingWebSpeechRef = useRef(false);
-  // Role of the Web Speech instance: "fallback" = authoritative (NineRouter unavailable),
-  // "assist" = fast signal only in parallel with a healthy NineRouter stream, "off" = not running.
-  const webSpeechModeRef = useRef<"off" | "fallback" | "assist">("off");
+  const webSpeechModeRef = useRef<"off" | "fallback">("off");
   const startWebSpeechRef = useRef<(() => void) | null>(null);
   const stopWebSpeechRef = useRef<(() => void) | null>(null);
+
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
   const onStartRef = useRef(onStart);
   const onStopRef = useRef(onStop);
   const onVoiceActivityRef = useRef(onVoiceActivity);
-  const onFastSignalRef = useRef(onFastSignal);
-  const onEchoCouplingRef = useRef(onEchoCoupling);
+  const isTtsPlayingRef = useRef(isTtsPlaying);
+  const bargeInModeEnteredRef = useRef(false);
 
-  // Interim stability detection refs
-  const stabilityTimer = useRef<NodeJS.Timeout | null>(null);
-  const lastInterimText = useRef<string>("");
-  const lastSpeechChunkMs = useRef(0);
-  const hadSpeechEnergyRef = useRef(false);
-
-  // Fast VAD duration-guard refs (see VAD_CONFIRM_MS / VAD_RELEASE_MS above)
+  const endpointTimer = useRef<NodeJS.Timeout | null>(null);
   const vadActiveRef = useRef(false);
-  const vadAboveSinceRef = useRef(0);
   const vadBelowSinceRef = useRef(0);
+  const hadSpeechThisUtteranceRef = useRef(false);
+  const awaitingFinalRef = useRef(false);
+  const micWarmupUntilRef = useRef(0);
+  const speechAboveSinceRef = useRef(0);
+  const lastSpeechLikelyAtRef = useRef(0);
 
-  // Adaptive VAD noise floor — EMA of RMS during confirmed non-speech (see
-  // VAD_NOISE_FLOOR_ALPHA / VAD_ADAPTIVE_MULTIPLIER above). Seeded at the
-  // configured minimum floor so it starts sane before any silence is observed.
-  const noiseFloorRef = useRef(RMS_SPEECH_THRESHOLD);
-
-  const emitTranscript = useCallback((text: string, isFinal: boolean) => {
-    const cleaned = sanitizeTranscript(text, isFinal, hadSpeechEnergyRef.current);
-    if (!cleaned) {
-      if (isFinal) {
-        log.debug(`🚫 Rejected final transcript (hallucination/noise): "${text}"`);
-      }
-      return false;
-    }
-
-    if (isFinal) {
-      setTranscript(cleaned);
-      setInterimTranscript("");
-      onTranscriptRef.current?.(cleaned, true);
-    } else {
-      setInterimTranscript(cleaned);
-      onTranscriptRef.current?.(cleaned, false);
-    }
-    return true;
-  }, []);
-
-  // Keep refs updated
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
     onErrorRef.current = onError;
     onStartRef.current = onStart;
     onStopRef.current = onStop;
     onVoiceActivityRef.current = onVoiceActivity;
-    onFastSignalRef.current = onFastSignal;
-    onEchoCouplingRef.current = onEchoCoupling;
-  }, [onTranscript, onError, onStart, onStop, onVoiceActivity, onFastSignal, onEchoCoupling]);
+    isTtsPlayingRef.current = isTtsPlaying;
+  }, [onTranscript, onError, onStart, onStop, onVoiceActivity, isTtsPlaying]);
 
-  // Web Speech transcript: authoritative in "fallback" mode (routed to onTranscript,
-  // same as before), fast-signal-only in "assist" mode (routed to onFastSignal instead).
-  const handleWebSpeechTranscript = useCallback((text: string, isFinal: boolean) => {
-    if (webSpeechModeRef.current === "fallback") {
-      onTranscriptRef.current?.(text, isFinal);
-    } else if (webSpeechModeRef.current === "assist") {
-      onFastSignalRef.current?.(text, isFinal);
+  const clearEndpointTimer = useCallback(() => {
+    if (endpointTimer.current) {
+      clearTimeout(endpointTimer.current);
+      endpointTimer.current = null;
     }
   }, []);
 
-  const handleWebSpeechError = useCallback((err: Error) => {
-    if (webSpeechModeRef.current === "fallback") {
-      onErrorRef.current?.(err);
+  const sendSttDiscard = useCallback(() => {
+    try {
+      wsRef.current?.send(JSON.stringify({ type: "stt_discard" }));
+    } catch {
+      /* ignore */
     }
-    // Assist mode: Web Speech errors are non-fatal — NineRouter stays authoritative
-  }, []);
+  }, [wsRef]);
 
-  const handleWebSpeechStart = useCallback(() => {
-    if (webSpeechModeRef.current === "fallback") {
-      usingWebSpeechRef.current = true;
-      isListeningRef.current = true;
-      setUseWebSpeech(true);
-      setIsListening(true);
-      onStartRef.current?.();
+  const sendSttCommit = useCallback(() => {
+    try {
+      wsRef.current?.send(JSON.stringify({ type: "stt_commit" }));
+      log.debug("Sent stt_commit");
+    } catch {
+      /* ignore */
     }
-    // Assist mode: NineRouter's own onStart already fired — no public state change
-  }, []);
+  }, [wsRef]);
 
-  const handleWebSpeechStop = useCallback(() => {
-    if (webSpeechModeRef.current === "fallback") {
-      usingWebSpeechRef.current = false;
-      isListeningRef.current = false;
-      setUseWebSpeech(false);
-      setIsListening(false);
-      onStopRef.current?.();
-    }
-    webSpeechModeRef.current = "off";
-  }, []);
+  const scheduleEndpoint = useCallback(() => {
+    if (!hadSpeechThisUtteranceRef.current) return;
+    clearEndpointTimer();
+    endpointTimer.current = setTimeout(() => {
+      if (!vadActiveRef.current && hadSpeechThisUtteranceRef.current) {
+        awaitingFinalRef.current = true;
+        sendSttCommit();
+        setInterimTranscript("");
+      }
+    }, ENDPOINT_SILENCE_MS);
+  }, [clearEndpointTimer, sendSttCommit]);
+
+  const discardUtterance = useCallback(() => {
+    hadSpeechThisUtteranceRef.current = false;
+    awaitingFinalRef.current = false;
+    bargeInModeEnteredRef.current = false;
+    clearEndpointTimer();
+    setInterimTranscript("");
+    sendSttDiscard();
+  }, [clearEndpointTimer, sendSttDiscard]);
 
   const webSpeech = useWebSpeechFallback({
     languageCode: config.languageCode || "en-US",
-    onTranscript: handleWebSpeechTranscript,
-    onError: handleWebSpeechError,
-    onStart: handleWebSpeechStart,
-    onStop: handleWebSpeechStop,
+    onTranscript: (text, isFinal) => {
+      if (webSpeechModeRef.current === "fallback") {
+        onTranscriptRef.current?.(text, isFinal);
+      }
+    },
+    onError: (err) => {
+      if (webSpeechModeRef.current === "fallback") onErrorRef.current?.(err);
+    },
+    onStart: () => {
+      if (webSpeechModeRef.current === "fallback") {
+        usingWebSpeechRef.current = true;
+        isListeningRef.current = true;
+        setUseWebSpeech(true);
+        setIsListening(true);
+        onStartRef.current?.();
+      }
+    },
+    onStop: () => {
+      if (webSpeechModeRef.current === "fallback") {
+        usingWebSpeechRef.current = false;
+        isListeningRef.current = false;
+        setUseWebSpeech(false);
+        setIsListening(false);
+        onStopRef.current?.();
+      }
+      webSpeechModeRef.current = "off";
+    },
   });
 
   useEffect(() => {
@@ -280,62 +221,82 @@ export function useGoogleSTT({
   }, [webSpeech.startListening, webSpeech.stopListening]);
 
   const fallbackToWebSpeech = useCallback((reason: string) => {
-    if (!isWebSpeechSupported()) {
-      log.error("Backend STT unavailable and Web Speech API is not supported");
-      return false;
-    }
-
-    log.warn(`Backend STT unavailable (${reason}) — falling back to Web Speech API`);
-    // Reclassify as authoritative — if an assist instance is already running (started
-    // alongside NineRouter), this flips its role; startListening() below is then a no-op.
+    if (!isWebSpeechSupported()) return false;
+    log.warn(`Backend STT unavailable (${reason}) — Web Speech fallback`);
     webSpeechModeRef.current = "fallback";
     usingWebSpeechRef.current = true;
     setUseWebSpeech(true);
     setError(null);
-    setTranscript("");
-    setInterimTranscript("");
     startWebSpeechRef.current?.();
     return true;
   }, []);
 
-  // ─── Clear stability timer ───
-  const clearStabilityTimer = useCallback(() => {
-    if (stabilityTimer.current) {
-      clearTimeout(stabilityTimer.current);
-      stabilityTimer.current = null;
-    }
-  }, []);
+  const stopListeningInternal = useCallback(
+    (sendBackendStop = true) => {
+      if (!isListeningRef.current && !usingWebSpeechRef.current) return;
 
-  // ─── Promote current interim transcript to final ───
-  const promoteInterimToFinal = useCallback((text: string) => {
-    if (!text || !isListeningRef.current) return;
+      isListeningRef.current = false;
+      clearEndpointTimer();
+      hadSpeechThisUtteranceRef.current = false;
+      awaitingFinalRef.current = false;
 
-    if (isLikelyHallucination(text, { isFinal: true, hadSpeechEnergy: hadSpeechEnergyRef.current })) {
-      log.debug(`🚫 Skipped interim→final promotion (hallucination): "${text}"`);
-      clearStabilityTimer();
-      lastInterimText.current = "";
-      return;
-    }
+      if (usingWebSpeechRef.current) {
+        stopWebSpeechRef.current?.();
+        usingWebSpeechRef.current = false;
+        STTInstanceManager.unregister(instanceId.current);
+        setUseWebSpeech(false);
+        setIsListening(false);
+        return;
+      }
 
-    if (!hadSpeechEnergyRef.current) {
-      log.debug(`🚫 Skipped interim→final promotion (no speech energy): "${text}"`);
-      clearStabilityTimer();
-      lastInterimText.current = "";
-      return;
-    }
+      STTInstanceManager.unregister(instanceId.current);
 
-    log.debug(`⏱️ Interim stable for ${interimStabilityMs}ms → promoting to final: "${text}"`);
+      if (inactivityTimer.current) {
+        clearTimeout(inactivityTimer.current);
+        inactivityTimer.current = null;
+      }
 
-    // Clear stability state
-    clearStabilityTimer();
-    lastInterimText.current = "";
-    hadSpeechEnergyRef.current = false;
-    lastSpeechChunkMs.current = 0;
+      if (vadActiveRef.current) {
+        vadActiveRef.current = false;
+        onVoiceActivityRef.current?.(false);
+      }
+      vadBelowSinceRef.current = 0;
 
-    emitTranscript(text, true);
-  }, [interimStabilityMs, clearStabilityTimer, emitTranscript]);
+      audioCapture.current?.stop();
+      audioCapture.current = null;
 
-  // ─── WebSocket message listener for STT responses ───
+      if (sendBackendStop) {
+        try {
+          wsRef.current?.send(JSON.stringify({ type: "stt_stop" }));
+        } catch {
+          /* ignore */
+        }
+      }
+
+      setIsListening(false);
+      onStopRef.current?.();
+    },
+    [wsRef, clearEndpointTimer]
+  );
+
+  const stopListening = useCallback(() => stopListeningInternal(), [stopListeningInternal]);
+
+  useEffect(() => {
+    if (!stopOnTabHidden) return;
+    const onHide = () => {
+      if (document.hidden && isListeningRef.current) stopListeningInternal();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => document.removeEventListener("visibilitychange", onHide);
+  }, [stopOnTabHidden, stopListeningInternal]);
+
+  useEffect(() => {
+    return () => {
+      clearEndpointTimer();
+      stopListeningInternal();
+    };
+  }, [stopListeningInternal, clearEndpointTimer]);
+
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws) return;
@@ -343,289 +304,149 @@ export function useGoogleSTT({
     const handleMessage = (event: MessageEvent) => {
       try {
         const message = JSON.parse(event.data);
-
         switch (message.type) {
           case "stt_transcript": {
-            const text = message.text || "";
-            const isFinal = message.isFinal || false;
+            const text = trimTranscript((message.text as string) || "");
+            const isFinal = Boolean(message.isFinal);
+            if (!text) break;
 
-            if (text) {
-              log.debug(`📝 Transcript ${isFinal ? "(final)" : "(interim)"}:`, text);
-
-              // Reset inactivity timer on any speech
-              resetInactivityTimer();
-
-              if (isFinal) {
-                clearStabilityTimer();
-                lastInterimText.current = "";
-                emitTranscript(text, true);
-              } else {
-                if (!emitTranscript(text, false)) break;
-
-                // If text changed, reset the stability timer
-                if (text !== lastInterimText.current) {
-                  lastInterimText.current = text;
-                  clearStabilityTimer();
-                  stabilityTimer.current = setTimeout(() => {
-                    promoteInterimToFinal(text);
-                  }, interimStabilityMs);
-                }
-              }
+            if (isFinal) {
+              clearEndpointTimer();
+              awaitingFinalRef.current = false;
+              hadSpeechThisUtteranceRef.current = false;
+              setTranscript(text);
+              setInterimTranscript("");
+              onTranscriptRef.current?.(text, true);
+            } else if (hadSpeechThisUtteranceRef.current || awaitingFinalRef.current) {
+              setInterimTranscript(text);
+              onTranscriptRef.current?.(text, false);
             }
             break;
           }
-
-          case "stt_started":
-            log.debug("✅ Backend confirmed STT started");
-            break;
-
-          case "stt_stopped":
-            log.debug("🛑 Backend confirmed STT stopped");
-            break;
-
           case "stt_error": {
-            const errMsg = message.error || "Unknown STT error";
-            log.error("❌ Backend STT error:", errMsg);
-
+            const errMsg = (message.error as string) || "Unknown STT error";
             if (isListeningRef.current && !usingWebSpeechRef.current && isBackendSttSetupError(errMsg)) {
-              // If Web Speech is already running as an assist signal, detach it first so
-              // stopListeningInternal() below doesn't stop it — calling stop() then start()
-              // back-to-back on the same SpeechRecognition object races the browser's async
-              // stop lifecycle. fallbackToWebSpeech() reclaims the still-running instance.
-              if (webSpeechModeRef.current === "assist") {
-                webSpeechModeRef.current = "off";
-              }
               stopListeningInternal(false);
-              if (fallbackToWebSpeech(errMsg)) {
-                break;
-              }
+              if (fallbackToWebSpeech(errMsg)) break;
             }
-
-            const err = new Error(errMsg);
-            setError(err);
-            onErrorRef.current?.(err);
+            onErrorRef.current?.(new Error(errMsg));
             break;
           }
         }
       } catch {
-        // Ignore non-JSON messages or parse errors
+        /* ignore */
       }
     };
 
     ws.addEventListener("message", handleMessage);
-    return () => {
-      ws.removeEventListener("message", handleMessage);
-    };
-  }, [wsRef.current, interimStabilityMs, clearStabilityTimer, promoteInterimToFinal, fallbackToWebSpeech, emitTranscript]);
+    return () => ws.removeEventListener("message", handleMessage);
+  }, [wsRef, clearEndpointTimer, fallbackToWebSpeech, stopListeningInternal]);
 
-  // ─── Inactivity timer ───
-  const resetInactivityTimer = useCallback(() => {
-    if (inactivityTimer.current) {
-      clearTimeout(inactivityTimer.current);
-    }
+  const enterBargeInMode = useCallback(() => {
+    if (bargeInModeEnteredRef.current) return;
+    bargeInModeEnteredRef.current = true;
+    audioCapture.current?.enterBargeInMode(3);
+    audioCapture.current?.clearAecReference();
+    clearEndpointTimer();
+  }, [clearEndpointTimer]);
 
-    if (inactivityTimeout > 0 && isListeningRef.current) {
-      inactivityTimer.current = setTimeout(() => {
-        // Before stopping, check if there's a pending interim transcript
-        if (lastInterimText.current) {
-          log.debug("⏱️ Inactivity timeout — promoting pending interim before stop");
-          promoteInterimToFinal(lastInterimText.current);
-        }
-        log.debug("⏱️ Inactivity timeout - stopping STT");
-        stopListeningInternal();
-      }, inactivityTimeout);
-    }
-  }, [inactivityTimeout, promoteInterimToFinal]);
-
-  // ─── Stop listening (internal) ───
-  const stopListeningInternal = useCallback((sendBackendStop = true) => {
-    if (!isListeningRef.current && !usingWebSpeechRef.current) return;
-
-    log.debug("🛑 Stopping STT...");
-    isListeningRef.current = false;
-
-    if (usingWebSpeechRef.current) {
-      usingWebSpeechRef.current = false;
-      stopWebSpeechRef.current?.();
-      STTInstanceManager.unregister(instanceId.current);
-      return;
-    }
-
-    // Unregister from global manager
-    STTInstanceManager.unregister(instanceId.current);
-
-    // Clear all timers
-    if (inactivityTimer.current) {
-      clearTimeout(inactivityTimer.current);
-      inactivityTimer.current = null;
-    }
-    clearStabilityTimer();
-    lastInterimText.current = "";
-    hadSpeechEnergyRef.current = false;
-    lastSpeechChunkMs.current = 0;
-    if (vadActiveRef.current) {
-      vadActiveRef.current = false;
-      onVoiceActivityRef.current?.(false);
-    }
-    vadAboveSinceRef.current = 0;
-    vadBelowSinceRef.current = 0;
-
-    // Stop the parallel Web Speech assist instance, if running
-    if (webSpeechModeRef.current === "assist") {
-      stopWebSpeechRef.current?.();
-      webSpeechModeRef.current = "off";
-    }
-
-    // Stop audio capture
-    if (audioCapture.current) {
-      audioCapture.current.stop();
-      audioCapture.current = null;
-    }
-
-    // Tell backend to stop STT
-    if (sendBackendStop) {
-      try {
-        const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "stt_stop" }));
-        }
-      } catch (err) {
-        log.error("Error sending stt_stop:", err);
-      }
-    }
-
-    setIsListening(false);
-    onStopRef.current?.();
-  }, [wsRef, clearStabilityTimer]);
-
-  // Public stopListening
-  const stopListening = useCallback(() => {
-    stopListeningInternal();
-  }, [stopListeningInternal]);
-
-  // ─── Tab visibility handler ───
-  useEffect(() => {
-    if (!stopOnTabHidden) return;
-
-    const handleVisibilityChange = () => {
-      if (document.hidden && isListeningRef.current) {
-        log.debug("👁️ Tab hidden - stopping STT");
-        stopListeningInternal();
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [stopOnTabHidden, stopListeningInternal]);
-
-  // ─── Cleanup on unmount ───
-  useEffect(() => {
-    return () => {
-      if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
-      clearStabilityTimer();
-      stopListeningInternal();
-    };
-  }, [stopListeningInternal, clearStabilityTimer]);
-
-  // ─── Start listening ───
   const startListening = useCallback(async () => {
     if (isListeningRef.current) return;
 
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      const err = new Error("WebSocket not connected. Cannot start speech recognition.");
-      setError(err);
-      onErrorRef.current?.(err);
+      onErrorRef.current?.(new Error("WebSocket not connected"));
       return;
     }
 
-    // Register with global manager (stops other instances)
     STTInstanceManager.register(stopListeningInternal, instanceId.current);
 
     try {
-      log.debug("🎙️ Starting Google STT...");
       setError(null);
       setTranscript("");
       setInterimTranscript("");
-      lastInterimText.current = "";
-      hadSpeechEnergyRef.current = false;
-      lastSpeechChunkMs.current = 0;
+      hadSpeechThisUtteranceRef.current = false;
+      awaitingFinalRef.current = false;
       vadActiveRef.current = false;
-      vadAboveSinceRef.current = 0;
       vadBelowSinceRef.current = 0;
-      noiseFloorRef.current = RMS_SPEECH_THRESHOLD;
-      clearStabilityTimer();
+      speechAboveSinceRef.current = 0;
+      lastSpeechLikelyAtRef.current = 0;
+      micWarmupUntilRef.current = Date.now() + MIC_WARMUP_MS;
+      clearEndpointTimer();
 
-      // Tell backend to start STT stream
-      ws.send(JSON.stringify({
-        type: "stt_start",
-        languageCode: config.languageCode || "en-US",
-        sampleRate: config.sampleRate || 16000,
-        model: config.model,
-      }));
+      ws.send(
+        JSON.stringify({
+          type: "stt_start",
+          languageCode: config.languageCode || "en-US",
+          sampleRate: config.sampleRate || 16000,
+          model: config.model,
+        })
+      );
 
-      // Create audio capture manager
       audioCapture.current = new AudioCaptureManager({
         sampleRate: config.sampleRate,
         channelCount: 1,
       });
 
-      // Start audio capture - send chunks to backend via WebSocket (VAD-gated)
-      await audioCapture.current.start((audioData: Uint8Array, rms: number, couplingStrength: number) => {
-        try {
-          onEchoCouplingRef.current?.(couplingStrength);
+      await audioCapture.current.start((audioData, rms, speechLikely) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !isListeningRef.current) {
+          return;
+        }
 
-          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !isListeningRef.current) {
-            return;
-          }
-
-          const now = Date.now();
-          // Adaptive threshold: RMS must clear the noise floor by a margin, with
-          // RMS_SPEECH_THRESHOLD as an absolute minimum (never trigger on near-silence
-          // even if the tracked floor has drifted close to zero in a very quiet room).
-          const adaptiveThreshold = Math.max(RMS_SPEECH_THRESHOLD, noiseFloorRef.current * VAD_ADAPTIVE_MULTIPLIER);
-          const isSpeech = rms >= adaptiveThreshold;
-          if (isSpeech) {
-            lastSpeechChunkMs.current = now;
-            hadSpeechEnergyRef.current = true;
-          } else {
-            // Only track the floor during confirmed non-speech, post-echo-cancellation RMS.
-            noiseFloorRef.current = noiseFloorRef.current * (1 - VAD_NOISE_FLOOR_ALPHA) + rms * VAD_NOISE_FLOOR_ALPHA;
-          }
-
-          // Fast VAD signal (duration-guarded): confirms/releases on sustained
-          // RMS above/below threshold, independent of the STT round-trip.
-          if (isSpeech) {
-            vadBelowSinceRef.current = 0;
-            if (vadAboveSinceRef.current === 0) vadAboveSinceRef.current = now;
-            if (!vadActiveRef.current && now - vadAboveSinceRef.current >= VAD_CONFIRM_MS) {
-              vadActiveRef.current = true;
-              onVoiceActivityRef.current?.(true);
-            }
-          } else {
-            vadAboveSinceRef.current = 0;
-            if (vadBelowSinceRef.current === 0) vadBelowSinceRef.current = now;
-            if (vadActiveRef.current && now - vadBelowSinceRef.current >= VAD_RELEASE_MS) {
-              vadActiveRef.current = false;
-              onVoiceActivityRef.current?.(false);
-            }
-          }
-
-          const inHangover = now - lastSpeechChunkMs.current < RMS_HANGOVER_MS;
-          if (!isSpeech && !inHangover) {
-            return; // Skip silent chunks — reduces Whisper hallucination on noise
-          }
-
-          const base64Data = uint8ArrayToBase64(audioData);
-          wsRef.current.send(JSON.stringify({
+        wsRef.current.send(
+          JSON.stringify({
             type: "stt_audio",
-            data: base64Data,
+            data: uint8ArrayToBase64(audioData),
             rms,
-          }));
-        } catch (err) {
-          log.error("Error sending audio data:", err);
+            speechLikely,
+          })
+        );
+
+        const now = Date.now();
+        const inWarmup = now < micWarmupUntilRef.current;
+        const ttsPlaying = isTtsPlayingRef.current?.() ?? false;
+
+        if (speechLikely && !inWarmup) {
+          lastSpeechLikelyAtRef.current = now;
+          if (speechAboveSinceRef.current === 0) speechAboveSinceRef.current = now;
+        } else if (!inWarmup && speechAboveSinceRef.current > 0) {
+          if (now - lastSpeechLikelyAtRef.current > SPEECH_GAP_HOLD_MS) {
+            speechAboveSinceRef.current = 0;
+          }
+        }
+
+        const bargeCandidate = speechLikely && ttsPlaying && !inWarmup;
+        if (bargeCandidate && !bargeInModeEnteredRef.current) {
+          enterBargeInMode();
+        }
+
+        const newlySustained =
+          !inWarmup &&
+          speechAboveSinceRef.current > 0 &&
+          now - speechAboveSinceRef.current >= SPEECH_SUSTAIN_MS;
+
+        if (newlySustained || bargeCandidate) {
+          hadSpeechThisUtteranceRef.current = true;
+        }
+
+        const voiceOn =
+          hadSpeechThisUtteranceRef.current &&
+          (speechLikely || now - lastSpeechLikelyAtRef.current < SPEECH_GAP_HOLD_MS);
+
+        if (voiceOn) {
+          vadBelowSinceRef.current = 0;
+          if (!vadActiveRef.current) {
+            vadActiveRef.current = true;
+            onVoiceActivityRef.current?.(true);
+            clearEndpointTimer();
+          }
+        } else if (vadActiveRef.current) {
+          if (vadBelowSinceRef.current === 0) vadBelowSinceRef.current = now;
+          if (now - vadBelowSinceRef.current >= VAD_RELEASE_MS) {
+            vadActiveRef.current = false;
+            onVoiceActivityRef.current?.(false);
+            if (hadSpeechThisUtteranceRef.current) scheduleEndpoint();
+          }
         }
       });
 
@@ -633,48 +454,23 @@ export function useGoogleSTT({
       setIsListening(true);
       onStartRef.current?.();
 
-      // Start Web Speech in parallel as a fast assist signal (not authoritative) —
-      // only while NineRouter is the active path and a consumer is actually wired up.
-      if (onFastSignalRef.current && isWebSpeechSupported()) {
-        webSpeechModeRef.current = "assist";
-        startWebSpeechRef.current?.();
-      }
-
-      // Start inactivity timer (if enabled)
-      resetInactivityTimer();
-
-      // NOTE: No frontend auto-refresh needed. The backend's GoogleSTTSession
-      // automatically handles the Google 5-minute stream limit by restarting
-      // the stream transparently. Audio capture stays uninterrupted.
-
-      log.debug("✅ Google STT started successfully", {
-        languageCode: config.languageCode,
-        sampleRate: config.sampleRate,
-      });
+      setTimeout(() => {
+        if (!isListeningRef.current) return;
+        if (!hadSpeechThisUtteranceRef.current) {
+          sendSttDiscard();
+          speechAboveSinceRef.current = 0;
+          if (vadActiveRef.current) {
+            vadActiveRef.current = false;
+            onVoiceActivityRef.current?.(false);
+          }
+          setInterimTranscript("");
+        }
+      }, MIC_WARMUP_MS);
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      log.error("❌ Failed to start Google STT:", error);
-
-      // Enhanced error messages
-      let userMessage = error.message;
-      if (error.message.includes("Permission denied") || error.message.includes("not-allowed")) {
-        userMessage = "Microphone permission is required. Please check your browser settings.";
-      } else if (error.message.includes("NotFoundError")) {
-        userMessage = "No microphone found. Please check that a microphone is connected.";
-      } else if (error.message.includes("WebSocket")) {
-        userMessage = "Cannot connect to backend. Please check that the server is running.";
-      }
-
-      const enhancedError = new Error(userMessage);
-      enhancedError.stack = error.stack;
-
-      setError(enhancedError);
-      onErrorRef.current?.(enhancedError);
-
-      // Cleanup on error
+      onErrorRef.current?.(err instanceof Error ? err : new Error(String(err)));
       stopListeningInternal();
     }
-  }, [config, wsRef, stopListeningInternal, resetInactivityTimer, clearStabilityTimer]);
+  }, [config, wsRef, stopListeningInternal, clearEndpointTimer, scheduleEndpoint, enterBargeInMode, sendSttDiscard]);
 
   return {
     isListening: useWebSpeech ? webSpeech.isListening : isListening,
@@ -682,6 +478,8 @@ export function useGoogleSTT({
     interimTranscript: useWebSpeech ? webSpeech.interimTranscript : interimTranscript,
     startListening,
     stopListening,
+    discardUtterance,
+    enterBargeInMode,
     error: useWebSpeech ? webSpeech.error : error,
   };
 }

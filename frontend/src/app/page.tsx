@@ -15,7 +15,8 @@ import archiveStorage from "@/utils/archiveStorage";
 import { toHiragana, preloadConverter } from "@/utils/hiraganaConverter";
 import {
   checkBargeIn,
-  clearTtsContent,
+  isRepeatSubmission,
+  notifyTtsPlaybackEnded,
   notifyTtsPlaybackStarted,
   registerTtsContent,
 } from "@/utils/bargeInGuard";
@@ -37,9 +38,6 @@ const GOOGLE_STT_CONFIG = {
 
 // Minimum characters required for final barge-in submission
 const BARGE_IN_MIN_CHARS = parseInt(process.env.NEXT_PUBLIC_BARGE_IN_MIN_CHARS || "5", 10);
-
-// Minimum characters for early barge-in detection (using partial transcripts)
-const EARLY_BARGE_IN_MIN_CHARS = parseInt(process.env.NEXT_PUBLIC_EARLY_BARGE_IN_MIN_CHARS || "2", 10);
 
 // Duck TTS volume while mic is active during AI speech (0.0–1.0, default 0.25)
 const TTS_DUCK_VOLUME = parseFloat(process.env.NEXT_PUBLIC_TTS_DUCK_VOLUME || "0.25");
@@ -96,15 +94,25 @@ export default function Home() {
   const appendToMessageRef = useRef<((messageId: string, sentence: string) => void) | null>(null);
   // Track if early barge-in was triggered (reset on final transcript)
   const earlyBargeInTriggeredRef = useRef(false);
-  // Latest assistant text for echo matching on non-sentence-sync audio
-  const lastAssistantTextRef = useRef("");
+
+  const lastSubmittedRef = useRef({ text: "", at: 0 });
+  const submitLockRef = useRef(false);
+  const discardSttRef = useRef<(() => void) | null>(null);
+  const bargeInSttRef = useRef<(() => void) | null>(null);
+  const voiceActiveRef = useRef(false);
 
   const audioPlayer = useAudioPlayer({
     onPlaybackStart: () => {
       notifyTtsPlaybackStarted();
-      if (lastAssistantTextRef.current) {
-        registerTtsContent(lastAssistantTextRef.current);
+      discardSttRef.current?.();
+    },
+    onPlaybackEnd: () => {
+      notifyTtsPlaybackEnded();
+      // Don't wipe user speech that started as AI finished — only clear leftover echo
+      if (!earlyBargeInTriggeredRef.current && !voiceActiveRef.current) {
+        discardSttRef.current?.();
       }
+      earlyBargeInTriggeredRef.current = false;
     },
     onSentencePlay: (sentence, index) => {
       registerTtsContent(sentence);
@@ -117,10 +125,7 @@ export default function Home() {
     },
   });
   const [voiceDetected, setVoiceDetected] = useState(false);
-  // Fast VAD signal (duration-guarded RMS) — confirms real voice activity before any STT transcript
   const [voiceActive, setVoiceActive] = useState(false);
-  // Acoustic echo coupling strength (0..1) from the NLMS echo canceller — see onEchoCoupling below
-  const echoCouplingRef = useRef(0);
   
   // Numbered selection state: which card is currently selected/focused
   const [selectedResultIndex, setSelectedResultIndex] = useState<number | null>(null);
@@ -418,7 +423,6 @@ export default function Home() {
 
     // CRITICAL: Cancel all audio - stops current playback and rejects old audio
     audioPlayer.cancelAllAudio();
-    clearTtsContent();
     restoreSharedVolume();
 
     // Reset sentence sync state for new response
@@ -486,59 +490,32 @@ export default function Home() {
     }
   }, [wsSendMessage, audioPlayer, waitingPhrase, userId, handleSaveToArchive, messages, selectedResultIndex]);
 
-  // Shared early-barge-in trigger — used both by NineRouter's own interim transcript
-  // and by the Web Speech assist signal (§9.4.L), whichever fires first "wins".
-  // Only ducks/cancels audio; final submission is always driven by NineRouter's onTranscript.
-  const tryEarlyBargeIn = useCallback((rawText: string, source: string) => {
-    const trimmedText = rawText.trim();
-    if (!trimmedText) return;
-
-    const aiSpeaking = audioPlayer.isPlaying || wsStatus === "speaking";
-    const bargeInCheck = checkBargeIn({
-      text: trimmedText,
-      isFinal: false,
-      aiSpeaking,
-      earlyMinChars: EARLY_BARGE_IN_MIN_CHARS,
-    });
-
-    if (!bargeInCheck.allowed) {
-      if (bargeInCheck.reason === "echo") {
-        log.debug(`🚫 Echo filtered (${source}): "${trimmedText}"`);
-      } else if (bargeInCheck.reason === "cooldown") {
-        log.debug(`⏳ Barge-in cooldown (${source}): ignoring "${trimmedText}"`);
-      }
-      return;
-    }
-
-    if (
-      aiSpeaking &&
-      trimmedText.length >= EARLY_BARGE_IN_MIN_CHARS &&
-      !earlyBargeInTriggeredRef.current
-    ) {
-      log.debug(`🟡 EARLY BARGE-IN (${source}): Stopping audio (${trimmedText.length} chars detected)`);
+  // Early barge-in: post-AEC VAD detects speech over TTS → stop playback + relax AEC
+  useEffect(() => {
+    const aiSpeaking = audioPlayer.isPlaying;
+    if (voiceActive && aiSpeaking && !earlyBargeInTriggeredRef.current) {
+      log.debug("🟡 EARLY BARGE-IN (VAD): stopping TTS playback");
       audioPlayer.cancelAllAudio();
       restoreSharedVolume();
       earlyBargeInTriggeredRef.current = true;
+      bargeInSttRef.current?.();
     }
-  }, [audioPlayer, wsStatus]);
+  }, [voiceActive, audioPlayer.isPlaying, wsStatus, audioPlayer]);
 
   // Google STT for voice input (streamed via backend WebSocket)
-  // Backend handles Google's 5-minute stream limit transparently — no frontend refresh needed.
-  // Mic stays on until user explicitly clicks stop. Barge-in supported via early interim detection.
   const transcribe = useGoogleSTT({
     config: GOOGLE_STT_CONFIG,
     wsRef,
     wsConnected: isConnected,
     stopOnTabHidden: true,
+    isTtsPlaying: useCallback(() => audioPlayer.isPlaying, [audioPlayer.isPlaying]),
     onTranscript: useCallback((text: string, isFinal: boolean) => {
       log.debug(`📝 Transcript ${isFinal ? "(final)" : "(interim)"}:`, text);
 
-      if (!isFinal) {
-        tryEarlyBargeIn(text, "nineRouter");
-        return;
-      }
+      if (!isFinal) return;
 
-      // FINAL: Submit transcript — NineRouter/Groq stays the sole source of truth for this
+      if (submitLockRef.current) return;
+
       const trimmedText = text.trim();
       const aiSpeaking = audioPlayer.isPlaying || wsStatus === "speaking";
 
@@ -546,95 +523,84 @@ export default function Home() {
         text: trimmedText,
         isFinal: true,
         aiSpeaking,
-        earlyMinChars: EARLY_BARGE_IN_MIN_CHARS,
+        earlyMinChars: 2,
       });
 
       if (!bargeInCheck.allowed) {
-        if (bargeInCheck.reason === "echo") {
-          log.debug(`🚫 Echo filtered: "${trimmedText}"`);
-        }
+        log.debug(`🚫 Blocked transcript (${bargeInCheck.reason}): "${trimmedText}"`);
+        earlyBargeInTriggeredRef.current = false;
         return;
       }
-
-      earlyBargeInTriggeredRef.current = false;
 
       if (!trimmedText || trimmedText.length < BARGE_IN_MIN_CHARS) {
         log.debug(`⏭️ Transcript too short (${trimmedText.length} chars), ignoring`);
+        earlyBargeInTriggeredRef.current = false;
         return;
       }
 
-      // Regular barge-in if early wasn't triggered
+      if (
+        Date.now() - lastSubmittedRef.current.at < 15000 &&
+        isRepeatSubmission(lastSubmittedRef.current.text, trimmedText)
+      ) {
+        log.debug(`⏭️ Duplicate transcript skipped: "${trimmedText}"`);
+        earlyBargeInTriggeredRef.current = false;
+        return;
+      }
+
+      submitLockRef.current = true;
+      earlyBargeInTriggeredRef.current = false;
+      lastSubmittedRef.current = { text: trimmedText, at: Date.now() };
+
       if (aiSpeaking) {
         log.debug("🔇 REGULAR BARGE-IN: Stopping audio");
         audioPlayer.cancelAllAudio();
         restoreSharedVolume();
       }
 
-      // Send to sendMessage - it will handle command detection and hiragana conversion
-      // Mic stays on for continuous conversation (barge-in supported)
       log.debug(`✅ Submitting: "${trimmedText}"`);
-      sendMessage(trimmedText).catch((err) => {
-        log.error("Failed to send message:", err);
-      });
-    }, [audioPlayer, wsStatus, sendMessage, tryEarlyBargeIn]),
+      sendMessage(trimmedText)
+        .catch((err) => {
+          log.error("Failed to send message:", err);
+        })
+        .finally(() => {
+          submitLockRef.current = false;
+        });
+    }, [audioPlayer, wsStatus, sendMessage]),
     onVoiceActivity: useCallback((active: boolean) => {
+      voiceActiveRef.current = active;
       setVoiceActive(active);
-    }, []),
-    // Web Speech assist signal (§9.4.L) — fast, not authoritative. Runs in parallel with
-    // NineRouter when supported; only accelerates the early-barge-in duck/cancel above.
-    onFastSignal: useCallback((text: string) => {
-      tryEarlyBargeIn(text, "webSpeechAssist");
-    }, [tryEarlyBargeIn]),
-    // Echo coupling strength (0..1) from the NLMS echo canceller — a ref, not state,
-    // since it updates ~2x/sec and only needs to be read when the duck effect below
-    // actually re-runs (on voiceActive/isPlaying changes), not on every tick itself.
-    onEchoCoupling: useCallback((strength: number) => {
-      echoCouplingRef.current = strength;
     }, []),
     onError: useCallback((err: Error) => {
       log.error("Google STT error:", err);
     }, []),
   });
 
-  // Keep latest assistant text for echo filter (non-chunked TTS)
+  useEffect(() => {
+    discardSttRef.current = transcribe.discardUtterance;
+    bargeInSttRef.current = transcribe.enterBargeInMode;
+  }, [transcribe.discardUtterance, transcribe.enterBargeInMode]);
+
+  // Register full assistant reply for echo matching (Whisper often captures multi-sentence TTS)
   useEffect(() => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
     if (lastAssistant?.content) {
-      lastAssistantTextRef.current = lastAssistant.content;
+      registerTtsContent(lastAssistant.content);
     }
   }, [messages]);
 
-  // Duck TTS volume while mic is active during AI speech — reduces speaker→mic echo.
-  // Ambient duck while just listening; deeper duck once VAD confirms real voice activity
-  // (duck-then-confirm: the actual cancel/send decision still waits on STT transcript below).
-  //
-  // Duck depth is blended by echo coupling strength (0..1, from the NLMS echo canceller):
-  // strong coupling (e.g. laptop built-in speaker) → duck all the way to the configured
-  // level; near-zero coupling (e.g. headphones — nothing to echo) → barely duck at all,
-  // since there's no real echo risk to guard against and ducking would only cost
-  // responsiveness/naturalness for no benefit.
+  // Duck TTS while mic is on and AI is speaking — single fixed level
   useEffect(() => {
-    const shouldDuck =
-      transcribe.isListening && (audioPlayer.isPlaying || wsStatus === "speaking");
-
+    const shouldDuck = transcribe.isListening && audioPlayer.isPlaying;
     if (shouldDuck) {
-      const coupling = Math.max(0, Math.min(1, echoCouplingRef.current));
-      const baseLevel = voiceActive ? TTS_VAD_DUCK_VOLUME : TTS_DUCK_VOLUME;
-      const duckTarget = 1 - coupling * (1 - baseLevel); // lerp(1, baseLevel, coupling)
-      duckSharedVolume(duckTarget);
+      duckSharedVolume(voiceActive ? TTS_VAD_DUCK_VOLUME : TTS_DUCK_VOLUME);
     } else {
       restoreSharedVolume();
     }
-  }, [transcribe.isListening, audioPlayer.isPlaying, wsStatus, voiceActive]);
+  }, [transcribe.isListening, audioPlayer.isPlaying, voiceActive]);
 
-  // Visual "listening" indicator — fast VAD signal or interim transcript, whichever comes first
-  const checkVoiceActivity = useCallback(() => {
+  useEffect(() => {
     setVoiceDetected(voiceActive || transcribe.interimTranscript.length > 0);
   }, [voiceActive, transcribe.interimTranscript]);
-
-  React.useEffect(() => {
-    checkVoiceActivity();
-  }, [checkVoiceActivity]);
 
   // Compute focused item info for the focus strip in chat section
   const focusedItem = useMemo(() => {
@@ -742,7 +708,7 @@ export default function Home() {
             isListening={transcribe.isListening}
             onStartListening={transcribe.startListening}
             onStopListening={transcribe.stopListening}
-            interimTranscript={transcribe.interimTranscript}
+            interimTranscript={transcribe.isListening ? transcribe.interimTranscript : ""}
             voiceDetected={voiceDetected}
             transcribeError={transcribe.error}
           />

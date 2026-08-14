@@ -24,6 +24,8 @@ interface UseAudioPlayerOptions {
   onSentencePlay?: (sentence: string, index: number) => void;
   /** Called when TTS playback begins (each chunk/full audio) — for echo guard cooldown */
   onPlaybackStart?: () => void;
+  /** Called when TTS fully stops (queue drained, cancelled, or error) */
+  onPlaybackEnd?: () => void;
 }
 
 interface UseAudioPlayerReturn {
@@ -44,6 +46,15 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
   onSentencePlayRef.current = options?.onSentencePlay;
   const onPlaybackStartRef = useRef(options?.onPlaybackStart);
   onPlaybackStartRef.current = options?.onPlaybackStart;
+  const onPlaybackEndRef = useRef(options?.onPlaybackEnd);
+  onPlaybackEndRef.current = options?.onPlaybackEnd;
+  const wasPlayingRef = useRef(false);
+
+  const markPlaybackEnded = useCallback(() => {
+    if (!wasPlayingRef.current) return;
+    wasPlayingRef.current = false;
+    onPlaybackEndRef.current?.();
+  }, []);
 
   // Queue for chunked audio playback
   const audioQueueRef = useRef<Map<number, string>>(new Map());
@@ -105,7 +116,8 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     // Reject all audio until new response with valid responseId
     acceptedResponseIdRef.current = "__CANCELLED__";
     setIsPlaying(false);
-  }, [stopSource]);
+    markPlaybackEnded();
+  }, [stopSource, markPlaybackEnded]);
 
   // Play full audio (for greeting, long_waiting, sequential TTS)
   const play = useCallback(
@@ -164,39 +176,43 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
         const { source } = await playAudioFromBase64(base64Audio, format);
         sourceRef.current = source;
         onPlaybackStartRef.current?.();
+        wasPlayingRef.current = true;
         setIsPlaying(true);
 
         source.onended = async () => {
-          setIsPlaying(false);
-
-          // If this was protected audio, wait delay then play queued audio
+          // Protected waiting audio is followed by the real reply — don't treat as TTS end yet
           if (isProtected) {
+            setIsPlaying(false);
             log.debug(`Protected audio ended, waiting ${POST_PROTECTED_DELAY}ms before playing result...`);
             isProtectedAudioRef.current = false;
 
-            // Wait the post-protected delay
             await new Promise(resolve => setTimeout(resolve, POST_PROTECTED_DELAY));
 
-            // Check if we have buffered chunks (parallel TTS)
             if (audioQueueRef.current.size > 0 && totalChunksRef.current > 0) {
               log.debug(`Playing buffered chunks (${audioQueueRef.current.size}/${totalChunksRef.current})`);
               isPlayingQueueRef.current = true;
               isProcessingChunkRef.current = false;
               currentChunkIndexRef.current = 0;
+              wasPlayingRef.current = true;
               setIsPlaying(true);
               if (processNextChunkRef.current) {
                 processNextChunkRef.current();
               }
+              return;
             }
-            // Otherwise check for queued full audio
-            else if (protectedAudioQueueRef.current.length > 0) {
+
+            if (protectedAudioQueueRef.current.length > 0) {
               const queued = protectedAudioQueueRef.current.shift();
               if (queued) {
                 log.debug(`Playing queued result audio (responseId: ${queued.responseId?.slice(-8) || 'none'})`);
                 play(queued.base64Audio, queued.format, queued.responseId, false);
+                return;
               }
             }
           }
+
+          setIsPlaying(false);
+          markPlaybackEnded();
         };
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
@@ -211,12 +227,12 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
         
         setIsPlaying(false);
         isProtectedAudioRef.current = false;
+        markPlaybackEnded();
       }
     },
-    [stopSource]
+    [stopSource, markPlaybackEnded]
   );
 
-  // Track chunk playback timing
   const chunkPlayStartRef = useRef<number>(0);
   const lastChunkEndRef = useRef<number>(0);
 
@@ -242,6 +258,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
         totalChunksRef.current = 0;
         chunkArrivalTimesRef.current.clear();
         setIsPlaying(false);
+        markPlaybackEnded();
       } else {
         // Waiting for chunk - log gap
         const waitingSince = lastChunkEndRef.current > 0 ? Math.round(now - lastChunkEndRef.current) : 0;
@@ -287,7 +304,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       currentChunkIndexRef.current++;
       processNextChunk();
     }
-  }, []);
+  }, [markPlaybackEnded]);
 
   // Track chunk arrival times for timing analysis
   const chunkArrivalTimesRef = useRef<Map<number, number>>(new Map());
@@ -382,9 +399,10 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       isPlayingQueueRef.current = true;
       isProcessingChunkRef.current = false;
       currentChunkIndexRef.current = 0;
-      onPlaybackStartRef.current?.();
-      setIsPlaying(true);
-      processNextChunk();
+    onPlaybackStartRef.current?.();
+    wasPlayingRef.current = true;
+    setIsPlaying(true);
+    processNextChunk();
       return;
     }
 
@@ -415,7 +433,8 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     currentChunkIndexRef.current = 0;
     totalChunksRef.current = 0;
     setIsPlaying(false);
-  }, [stopSource]);
+    markPlaybackEnded();
+  }, [stopSource, markPlaybackEnded]);
 
   // Set volume via shared GainNode
   const setVolume = useCallback((volume: number) => {

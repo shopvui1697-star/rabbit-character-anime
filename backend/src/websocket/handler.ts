@@ -1824,13 +1824,31 @@ async function handleMessage(session: Session, data: string): Promise<void> {
         if (session.sttSession) {
           try {
             const base64Data = (message as any).data;
+            const rms = typeof (message as any).rms === "number" ? (message as any).rms : undefined;
+            const speechLikely = (message as any).speechLikely === true;
             if (base64Data) {
               const audioBuffer = Buffer.from(base64Data, "base64");
-              session.sttSession.writeAudio(audioBuffer);
+              session.sttSession.writeAudio(audioBuffer, rms, { speechLikely });
             }
           } catch (error) {
             session.log.error("Error processing STT audio:", error);
           }
+        }
+        break;
+      }
+
+      case "stt_discard": {
+        if (session.sttSession) {
+          session.sttSession.discardBuffer();
+          session.log.debug("9Router STT buffer discarded");
+        }
+        break;
+      }
+
+      case "stt_commit": {
+        if (session.sttSession) {
+          session.sttSession.commitUtterance();
+          session.log.debug("9Router STT utterance committed");
         }
         break;
       }

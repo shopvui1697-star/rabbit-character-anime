@@ -27,7 +27,7 @@ const OBVIOUS_HALLUCINATION_PATTERNS: RegExp[] = [
   /お疲れ様でした/,
 ];
 
-/** Reject on interim or when no speech energy — may be valid short user utterances. */
+/** Reject only when the clip had no speech energy — valid short user utterances otherwise. */
 const SHORT_FILLER_PATTERNS: RegExp[] = [
   /^(you|the|a|an|um+|uh+|hmm+|oh+|ah+|er+|mhm+)\s*[.!?]*$/i,
   /^(thanks|thank you)[.!?\s]*$/i,
@@ -64,7 +64,8 @@ export function isLikelyHallucination(
   const trimmed = text.trim();
   if (!trimmed) return true;
 
-  if (trimmed.length <= 2 && !/^[\u3040-\u30ff\u4e00-\u9fff]{1,2}$/.test(trimmed)) {
+  // Single ASCII glyph is noise; 2+ chars ("hi", "no", "Hello?") can be real speech.
+  if (trimmed.length < 2 && !/^[\u3040-\u30ff\u4e00-\u9fff]$/.test(trimmed)) {
     return true;
   }
 
@@ -76,12 +77,17 @@ export function isLikelyHallucination(
     if (pattern.test(trimmed)) return true;
   }
 
-  const hadEnergy = options?.hadSpeechEnergy !== false;
-  const checkFillers = !options?.isFinal || !hadEnergy;
-  if (checkFillers) {
+  // Reject filler hallucinations when the current audio window has no speech energy.
+  const hadEnergy = options?.hadSpeechEnergy === true;
+  if (!hadEnergy) {
     for (const pattern of SHORT_FILLER_PATTERNS) {
       if (pattern.test(trimmed)) return true;
     }
+  }
+
+  // Interim without speech energy — Whisper silence hallucination
+  if (!options?.isFinal && !hadEnergy) {
+    return true;
   }
 
   return false;

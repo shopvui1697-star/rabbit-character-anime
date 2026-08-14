@@ -27,6 +27,8 @@ import {
 const log = createLogger("NineRouterSTT");
 
 const MAX_WINDOW_SECONDS = 15;
+/** Groq on-demand free/dev tier is 20 RPM — space Whisper calls to stay under it. */
+const GROQ_MIN_REQUEST_GAP_MS = 2600;
 
 export interface NineRouterSTTConfig {
   languageCode: string;
@@ -59,6 +61,20 @@ export class NineRouterSTTSession {
   private credentialErrorReported = false;
   private hadSpeechEnergy = false;
   private silentTranscribeCount = 0;
+  private bytesAtLastTranscribe = 0;
+  private lastRequestAt = 0;
+  private pausedUntil = 0;
+  private abortController: AbortController | null = null;
+  private utteranceId = 0;
+  /** Set when frontend VAD reports speech-level RMS on any chunk this utterance. */
+  private utteranceHadSpeech = false;
+  private speechJustStarted = false;
+  /** Consecutive speechLikely chunks — avoids Whisper on single noise blip at mic start. */
+  private speechLikelyStreak = 0;
+  private lastSpeechLikelyAt = 0;
+  private sessionStartedAt = 0;
+  private static readonly MIC_WARMUP_MS = 800;
+  private static readonly SPEECH_GAP_MS = 400;
 
   constructor(sttConfig: NineRouterSTTConfig, callbacks: NineRouterSTTCallbacks) {
     this.config = sttConfig;
@@ -77,7 +93,15 @@ export class NineRouterSTTSession {
     this.pendingFinal = false;
     this.credentialErrorReported = false;
     this.hadSpeechEnergy = false;
+    this.utteranceHadSpeech = false;
+    this.speechLikelyStreak = 0;
     this.silentTranscribeCount = 0;
+    this.bytesAtLastTranscribe = 0;
+    this.lastRequestAt = 0;
+    this.pausedUntil = 0;
+    this.sessionStartedAt = Date.now();
+    this.lastSpeechLikelyAt = 0;
+    this.utteranceId++;
     this.endpoint = await resolveSttEndpoint(this.config.model);
 
     if (this.endpoint.source === "ninerouter") {
@@ -102,12 +126,40 @@ export class NineRouterSTTSession {
     });
   }
 
-  writeAudio(audioData: Buffer | Uint8Array): void {
+  writeAudio(
+    audioData: Buffer | Uint8Array,
+    rms?: number,
+    options?: { speechLikely?: boolean }
+  ): void {
     if (!this.isActive) return;
+
+    const now = Date.now();
+    const inWarmup = now - this.sessionStartedAt < NineRouterSTTSession.MIC_WARMUP_MS;
+    const likely = options?.speechLikely === true;
+
+    if (likely && !inWarmup) {
+      if (now - this.lastSpeechLikelyAt > NineRouterSTTSession.SPEECH_GAP_MS) {
+        this.speechLikelyStreak = 1;
+      } else {
+        this.speechLikelyStreak++;
+      }
+      this.lastSpeechLikelyAt = now;
+
+      if (this.speechLikelyStreak >= 2 || this.utteranceHadSpeech) {
+        if (!this.utteranceHadSpeech) this.speechJustStarted = true;
+        this.utteranceHadSpeech = true;
+        this.hadSpeechEnergy = true;
+      }
+    }
 
     const chunk = Buffer.from(audioData);
     this.audioChunks.push(chunk);
     this.totalBytes += chunk.length;
+
+    if (this.speechJustStarted) {
+      this.speechJustStarted = false;
+      void this.transcribeWindow(false);
+    }
   }
 
   stop(): void {
@@ -118,21 +170,76 @@ export class NineRouterSTTSession {
     return this.isActive;
   }
 
+  /** Drop buffered PCM without transcribing (e.g. after TTS playback ends). */
+  discardBuffer(): void {
+    this.utteranceId++;
+    this.resetBufferState();
+    log.debug("STT buffer discarded");
+  }
+
+  /** Run final Whisper on current buffer, then clear for the next utterance. */
+  commitUtterance(): void {
+    void (async () => {
+      while (this.inFlight) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      if (!this.isActive) return;
+      if (!this.utteranceHadSpeech) {
+        log.debug("🔇 Skipping stt_commit — no VAD-confirmed speech this utterance");
+        this.resetBufferState();
+        return;
+      }
+      await this.transcribeWindow(true);
+      this.utteranceId++;
+      this.resetBufferState();
+    })();
+  }
+
   destroy(): void {
-    this.stopInternal(true);
+    // Disconnect / replace session — drop in-flight work, do not spend another Whisper call
+    this.stopInternal(false);
   }
 
   private getModel(): string {
     return this.endpoint?.model || this.config.model || config.ninerouter.sttModel;
   }
 
+  private resetBufferState(): void {
+    this.audioChunks = [];
+    this.totalBytes = 0;
+    this.lastTranscript = "";
+    this.hadSpeechEnergy = false;
+    this.utteranceHadSpeech = false;
+    this.speechLikelyStreak = 0;
+    this.lastSpeechLikelyAt = 0;
+    this.silentTranscribeCount = 0;
+    this.bytesAtLastTranscribe = 0;
+  }
+
+  private parseRetryMs(message: string): number {
+    const match = message.match(/try again in (\d+(?:\.\d+)?)s/i);
+    if (match) return Math.ceil(parseFloat(match[1]) * 1000) + 250;
+    return GROQ_MIN_REQUEST_GAP_MS;
+  }
+
   private handleTranscriptionError(err: Error, isFinal: boolean): void {
+    if (err.name === "AbortError" || /aborted/i.test(err.message)) {
+      return;
+    }
+
     if (isSttCredentialError(err.message)) {
       if (!this.credentialErrorReported) {
         this.credentialErrorReported = true;
         this.callbacks.onError(new Error(formatSttSetupError(this.getModel())));
       }
       this.stopInternal(false);
+      return;
+    }
+
+    if (/rate limit/i.test(err.message)) {
+      const waitMs = this.parseRetryMs(err.message);
+      this.pausedUntil = Date.now() + waitMs;
+      log.warn(`STT rate-limited — pausing ${waitMs}ms`);
       return;
     }
 
@@ -144,8 +251,8 @@ export class NineRouterSTTSession {
   }
 
   private getMinAudioBytes(isFinal: boolean): number {
-    // Interim: require ≥0.8s audio to reduce Whisper hallucination on short noise
-    const seconds = isFinal ? 0.4 : 0.8;
+    // Interim: ≥0.5s — balance latency vs Whisper noise hallucination
+    const seconds = isFinal ? 0.35 : 0.5;
     return Math.floor(this.config.sampleRateHertz * 2 * seconds);
   }
 
@@ -178,18 +285,27 @@ export class NineRouterSTTSession {
       return;
     }
 
+    if (!isFinal && Date.now() < this.pausedUntil) {
+      return;
+    }
+
+    // Same PCM already sent — don't burn Groq RPM re-transcribing unchanged audio
+    if (!isFinal && this.totalBytes <= this.bytesAtLastTranscribe) {
+      return;
+    }
+
+    if (
+      !isFinal &&
+      this.endpoint?.source === "groq-direct" &&
+      this.lastRequestAt > 0 &&
+      Date.now() - this.lastRequestAt < GROQ_MIN_REQUEST_GAP_MS
+    ) {
+      return;
+    }
+
     const pcm = isFinal ? this.getFullBuffer() : this.getWindowBuffer();
     const minBytes = this.getMinAudioBytes(isFinal);
     if (pcm.length < minBytes) {
-      if (isFinal && this.lastTranscript && this.hadSpeechEnergy) {
-        const cleaned = sanitizeTranscript(this.lastTranscript, {
-          isFinal: true,
-          hadSpeechEnergy: true,
-        });
-        if (cleaned) {
-          this.callbacks.onTranscript(cleaned, true);
-        }
-      }
       return;
     }
 
@@ -199,32 +315,33 @@ export class NineRouterSTTSession {
       this.silentTranscribeCount = 0;
     } else {
       this.silentTranscribeCount++;
-      // Skip Whisper call on silent audio — main anti-hallucination gate
       if (!isFinal) {
-        if (this.silentTranscribeCount >= 5) {
-          // Drop stale buffer after prolonged silence to avoid noise buildup
-          this.audioChunks = [];
-          this.totalBytes = 0;
-          this.lastTranscript = "";
-        }
         log.debug(`🔇 Skipping interim STT — silence (RMS < ${STT_MIN_SPEECH_RMS})`);
         return;
       }
-      if (!this.hadSpeechEnergy) {
+      if (!this.utteranceHadSpeech && !this.hadSpeechEnergy) {
         log.debug("🔇 Skipping final STT — no speech detected in session");
         return;
       }
     }
 
+    // Interim: only call Whisper after post-AEC VAD confirmed speech
+    if (!isFinal && !this.utteranceHadSpeech) {
+      return;
+    }
+
     this.inFlight = true;
+    this.bytesAtLastTranscribe = this.totalBytes;
+    const utteranceId = this.utteranceId;
 
     try {
       const rawText = await this.requestTranscription(pcm);
+      if (!this.isActive || utteranceId !== this.utteranceId) return;
       if (!rawText) return;
 
       const cleaned = sanitizeTranscript(rawText, {
         isFinal,
-        hadSpeechEnergy: speechDetected || this.hadSpeechEnergy,
+        hadSpeechEnergy: this.utteranceHadSpeech || speechDetected || this.hadSpeechEnergy,
       });
 
       if (!cleaned) {
@@ -271,10 +388,15 @@ export class NineRouterSTTSession {
       headers.Authorization = `Bearer ${endpoint.apiKey}`;
     }
 
+    this.abortController?.abort();
+    this.abortController = new AbortController();
+    this.lastRequestAt = Date.now();
+
     const response = await fetch(endpoint.transcriptionUrl, {
       method: "POST",
       headers,
       body: form,
+      signal: this.abortController.signal,
     });
 
     if (!response.ok) {
@@ -286,32 +408,35 @@ export class NineRouterSTTSession {
   }
 
   private stopInternal(runFinal: boolean): void {
-    this.isActive = false;
-    this.pendingFinal = false;
-
     if (this.transcribeTimer) {
       clearInterval(this.transcribeTimer);
       this.transcribeTimer = null;
     }
 
-    if (runFinal) {
-      void this.transcribeWindow(true).finally(() => {
-        this.audioChunks = [];
-        this.totalBytes = 0;
-        this.lastTranscript = "";
-        this.hadSpeechEnergy = false;
-        this.silentTranscribeCount = 0;
-        this.callbacks.onStopped?.();
-      });
+    const finish = () => {
+      this.isActive = false;
+      this.pendingFinal = false;
+      this.abortController?.abort();
+      this.abortController = null;
+      this.resetBufferState();
+      this.callbacks.onStopped?.();
+    };
+
+    if (!runFinal) {
+      finish();
       return;
     }
 
-    this.audioChunks = [];
-    this.totalBytes = 0;
-    this.lastTranscript = "";
-    this.hadSpeechEnergy = false;
-    this.silentTranscribeCount = 0;
-    this.callbacks.onStopped?.();
+    void (async () => {
+      while (this.inFlight) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      try {
+        await this.transcribeWindow(true);
+      } finally {
+        finish();
+      }
+    })();
   }
 }
 

@@ -5,7 +5,7 @@
  */
 
 import { createLogger } from "@/utils/logger";
-import { onPlaybackReference } from "@/utils/audioUnlock";
+import { getSharedAudioContext, onPlaybackReference } from "@/utils/audioUnlock";
 
 const log = createLogger("AudioUtils");
 
@@ -166,7 +166,7 @@ export class AudioCaptureManager {
   private processorNode: AudioWorkletNode | null = null;
   private silentGainNode: GainNode | null = null;
   private rnnoiseNode: AudioWorkletNode | null = null;
-  private onAudioData: ((data: Uint8Array, rms: number, couplingStrength: number) => void) | null = null;
+  private onAudioData: ((data: Uint8Array, rms: number, speechLikely: boolean) => void) | null = null;
   private config: AudioCaptureConfig;
   private useRNNoise: boolean = ENABLE_RNNOISE; // Use global toggle
   private unsubscribeReference: (() => void) | null = null;
@@ -175,33 +175,25 @@ export class AudioCaptureManager {
     this.config = { ...DEFAULT_AUDIO_CONFIG, ...config };
   }
 
-  async start(onAudioData: (data: Uint8Array, rms: number, couplingStrength: number) => void): Promise<void> {
+  async start(onAudioData: (data: Uint8Array, rms: number, speechLikely: boolean) => void): Promise<void> {
     this.onAudioData = onAudioData;
 
-    // Request microphone access
-    // Note: Don't specify sampleRate — let browser use native hardware rate
-    // to avoid browser-internal resampling latency. The AudioWorklet handles
-    // resampling to 16kHz for AWS Transcribe.
-    // Optimized for Japanese speech recognition
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: this.config.channelCount,
-        echoCancellation: this.config.echoCancellation,
-        noiseSuppression: this.useRNNoise ? false : this.config.noiseSuppression, // Use browser's if RNNoise disabled
+        echoCancellation: AEC_CONFIG.enabled ? false : this.config.echoCancellation,
+        noiseSuppression: this.useRNNoise ? false : this.config.noiseSuppression,
         autoGainControl: this.config.autoGainControl,
-        // Additional constraints for better voice capture
-        // Note: latency: 0 can cause audio dropout - use 'interactive' hint instead
-        sampleSize: 16, // 16-bit audio for better quality
+        sampleSize: 16,
       },
     });
 
-    // Create audio context at native hardware sample rate (typically 48kHz).
-    // Forcing 16kHz causes the browser to insert an internal resampler between
-    // hardware and context, adding significant input latency on macOS.
-    // The AudioWorklet handles resampling to 16kHz instead.
-    // 'interactive' latencyHint requests the smallest internal buffer the
-    // platform supports, reducing capture-to-process latency.
-    this.audioContext = new AudioContext({ latencyHint: 'interactive' });
+    // Single shared AudioContext for capture + playback — required so AEC reference
+    // startTime and mic process() currentTime share one clock (Web Audio spec).
+    this.audioContext = getSharedAudioContext();
+    if (this.audioContext.state === "suspended") {
+      await this.audioContext.resume();
+    }
 
     // Create source node
     this.source = this.audioContext.createMediaStreamSource(this.mediaStream);
@@ -228,19 +220,20 @@ export class AudioCaptureManager {
       sampleRate: this.config.sampleRate,
     });
 
-    // Relay TTS playback audio to the worklet as the AEC reference signal.
-    // Timestamp with THIS (capture) AudioContext's currentTime, read synchronously
-    // right here — the listener fires synchronously from inside `source.start(0)`
-    // on the playback side, so "now" on both contexts' clocks is the same instant.
-    this.unsubscribeReference = onPlaybackReference((samples, refSampleRate) => {
+    // Relay TTS reference with the playback context's startTime and effective gain.
+    this.unsubscribeReference = onPlaybackReference((samples, refSampleRate, startTime, gain) => {
       if (!AEC_CONFIG.enabled || !this.processorNode || !this.audioContext) return;
-      const startTime = this.audioContext.currentTime;
-      const resampled =
+      let resampled =
         refSampleRate === this.audioContext.sampleRate
-          ? new Float32Array(samples) // copy — postMessage transfer takes ownership
+          ? new Float32Array(samples)
           : resampleAudio(samples, refSampleRate, this.audioContext.sampleRate);
+      if (gain !== 1) {
+        const scaled = new Float32Array(resampled.length);
+        for (let i = 0; i < resampled.length; i++) scaled[i] = resampled[i] * gain;
+        resampled = scaled;
+      }
       this.processorNode.port.postMessage(
-        { type: 'referenceAudio', data: resampled, startTime },
+        { type: "referenceAudio", data: resampled, startTime },
         [resampled.buffer]
       );
     });
@@ -248,9 +241,9 @@ export class AudioCaptureManager {
     // Handle audio data from worklet
     this.processorNode.port.onmessage = (event) => {
       if (event.data.type === 'audioData') {
-        const rms = typeof event.data.rms === 'number' ? event.data.rms : 0;
-        const couplingStrength = typeof event.data.couplingStrength === 'number' ? event.data.couplingStrength : 0;
-        this.onAudioData?.(event.data.data, rms, couplingStrength);
+        const rms = typeof event.data.rms === "number" ? event.data.rms : 0;
+        const speechLikely = event.data.speechLikely === true;
+        this.onAudioData?.(event.data.data, rms, speechLikely);
       }
     };
 
@@ -328,6 +321,14 @@ export class AudioCaptureManager {
     }
   }
 
+  enterBargeInMode(durationSec = 3): void {
+    this.processorNode?.port.postMessage({ type: "bargeInActive", durationSec });
+  }
+
+  clearAecReference(): void {
+    this.processorNode?.port.postMessage({ type: "clearReference" });
+  }
+
   stop(): void {
     if (this.unsubscribeReference) {
       this.unsubscribeReference();
@@ -362,7 +363,7 @@ export class AudioCaptureManager {
     }
 
     if (this.audioContext) {
-      this.audioContext.close();
+      // Shared context — disconnect nodes only, do not close
       this.audioContext = null;
     }
 

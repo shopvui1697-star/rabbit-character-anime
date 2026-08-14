@@ -33,7 +33,8 @@ export function isLikelyHallucination(
   const trimmed = text.trim();
   if (!trimmed) return true;
 
-  if (trimmed.length <= 2 && !/^[\u3040-\u30ff\u4e00-\u9fff]{1,2}$/.test(trimmed)) {
+  // Single ASCII glyph is noise; 2+ chars ("hi", "no", "Hello?") can be real speech.
+  if (trimmed.length < 2 && !/^[\u3040-\u30ff\u4e00-\u9fff]$/.test(trimmed)) {
     return true;
   }
 
@@ -45,9 +46,11 @@ export function isLikelyHallucination(
     return true;
   }
 
-  const hadEnergy = options?.hadSpeechEnergy !== false;
-  const checkFillers = !options?.isFinal || !hadEnergy;
-  if (checkFillers && SHORT_FILLER_PATTERNS.some((p) => p.test(trimmed))) {
+  const hadEnergy = options?.hadSpeechEnergy === true;
+  if (!hadEnergy && SHORT_FILLER_PATTERNS.some((p) => p.test(trimmed))) {
+    return true;
+  }
+  if (!options?.isFinal && !hadEnergy && trimmed.length < 5) {
     return true;
   }
 
