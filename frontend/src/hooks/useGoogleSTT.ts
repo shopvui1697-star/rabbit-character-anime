@@ -13,9 +13,10 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { AudioCaptureManager } from "@/utils/audioUtils";
+import { AudioCaptureManager, pcm16BytesToFloat32 } from "@/utils/audioUtils";
 import { createLogger } from "@/utils/logger";
 import { isWebSpeechSupported, useWebSpeechFallback } from "./useWebSpeechFallback";
+import { getSileroVadClient, SILERO_FRAME_SAMPLES } from "@/utils/sileroVadClient";
 
 import { sanitizeTranscript, isLikelyHallucination } from "@/utils/sttTranscriptGuard";
 
@@ -28,8 +29,9 @@ const DEFAULT_INTERIM_STABILITY_MS = parseInt(
   10
 );
 
-// Fast VAD (voice activity detection) duration-guard — confirms real speech from raw mic RMS
-// well before any STT transcript arrives. Reuses RMS_SPEECH_THRESHOLD above as the energy gate.
+// Fast VAD (voice activity detection) duration-guard — confirms real speech
+// well before any STT transcript arrives. Independent of which engine below
+// decides "is this chunk speech" per-frame.
 const VAD_CONFIRM_MS = parseInt(process.env.NEXT_PUBLIC_VAD_CONFIRM_MS || "200", 10);
 const VAD_RELEASE_MS = parseInt(process.env.NEXT_PUBLIC_VAD_RELEASE_MS || "200", 10);
 
@@ -39,8 +41,18 @@ const VAD_RELEASE_MS = parseInt(process.env.NEXT_PUBLIC_VAD_RELEASE_MS || "200",
 // tracks the mic input AFTER echo cancellation (see AudioCaptureManager), so residual
 // echo that leaks through also gets absorbed into "ambient noise" rather than
 // repeatedly tripping VAD at a fixed threshold that has to be hand-tuned per environment.
+// Only used by the "rms" engine below (default fallback if Silero fails to load).
 const VAD_NOISE_FLOOR_ALPHA = parseFloat(process.env.NEXT_PUBLIC_VAD_NOISE_FLOOR_ALPHA || "0.05");
 const VAD_ADAPTIVE_MULTIPLIER = parseFloat(process.env.NEXT_PUBLIC_VAD_ADAPTIVE_MULTIPLIER || "3.0");
+
+// VAD engine: pure-RMS-energy proved unreliable in real-world testing even after
+// tuning (phantom words from noise, missed/clipped quiet speech) — see
+// BARGE_IN_CONFIG.md §7.1.C (v3). "silero" runs a real neural VAD model (tiny,
+// ~2MB, but real inference cost — accepted trade-off) client-side via
+// sileroVadClient.ts; automatically falls back to "rms" for the rest of the
+// session if the model/wasm fails to load (e.g. slow network, unsupported browser).
+const VAD_ENGINE = (process.env.NEXT_PUBLIC_VAD_ENGINE || "silero").toLowerCase();
+const VAD_SILERO_THRESHOLD = parseFloat(process.env.NEXT_PUBLIC_VAD_SILERO_THRESHOLD || "0.5");
 
 /**
  * Global STT Instance Manager
@@ -195,6 +207,55 @@ export function useGoogleSTT({
   // VAD_NOISE_FLOOR_ALPHA / VAD_ADAPTIVE_MULTIPLIER above). Seeded at the
   // configured minimum floor so it starts sane before any silence is observed.
   const noiseFloorRef = useRef(RMS_SPEECH_THRESHOLD);
+
+  // Silero VAD engine state: samples left over from the previous ~100ms chunk
+  // that didn't fill a full SILERO_FRAME_SAMPLES (512) frame, carried forward
+  // so frames stay aligned regardless of the worklet's chunk size. `failed`
+  // flips permanently to true for the session the first time the model/worker
+  // errors, so we don't keep retrying (and logging) on every subsequent chunk.
+  const sileroLeftoverRef = useRef<Float32Array>(new Float32Array(0));
+  const sileroFailedRef = useRef(false);
+  // Serializes processSileroChunk() calls end-to-end (not just the individual
+  // processFrame() calls inside it) — the leftover-buffer read-then-write below
+  // is a non-atomic read-modify-write across an await, so two chunks arriving
+  // back-to-back (e.g. if inference falls behind the ~100ms chunk cadence on a
+  // slow device) would race on sileroLeftoverRef without this queue.
+  const sileroChunkQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  /** RMS-adaptive-threshold VAD decision (the pre-Silero engine, kept as fallback). */
+  const computeRmsIsSpeech = useCallback((rms: number): boolean => {
+    const adaptiveThreshold = Math.max(RMS_SPEECH_THRESHOLD, noiseFloorRef.current * VAD_ADAPTIVE_MULTIPLIER);
+    const isSpeech = rms >= adaptiveThreshold;
+    if (!isSpeech) {
+      noiseFloorRef.current = noiseFloorRef.current * (1 - VAD_NOISE_FLOOR_ALPHA) + rms * VAD_NOISE_FLOOR_ALPHA;
+    }
+    return isSpeech;
+  }, []);
+
+  /**
+   * Feed one ~100ms PCM16 chunk (1600 samples @ 16kHz) through Silero VAD,
+   * split into SILERO_FRAME_SAMPLES (512-sample) frames — the model's traced
+   * input size. Returns the max speech probability across the frames covering
+   * this chunk (biased toward not missing a speech onset that starts mid-chunk).
+   */
+  const processSileroChunk = useCallback(async (pcm16: Uint8Array): Promise<number> => {
+    const floatSamples = pcm16BytesToFloat32(pcm16);
+    const leftover = sileroLeftoverRef.current;
+    const combined = new Float32Array(leftover.length + floatSamples.length);
+    combined.set(leftover, 0);
+    combined.set(floatSamples, leftover.length);
+
+    const frameCount = Math.floor(combined.length / SILERO_FRAME_SAMPLES);
+    const client = getSileroVadClient();
+    let maxProb = 0;
+    for (let i = 0; i < frameCount; i++) {
+      const frame = combined.subarray(i * SILERO_FRAME_SAMPLES, (i + 1) * SILERO_FRAME_SAMPLES);
+      const prob = await client.processFrame(frame);
+      if (prob > maxProb) maxProb = prob;
+    }
+    sileroLeftoverRef.current = combined.slice(frameCount * SILERO_FRAME_SAMPLES);
+    return maxProb;
+  }, []);
 
   const emitTranscript = useCallback((text: string, isFinal: boolean) => {
     const cleaned = sanitizeTranscript(text, isFinal, hadSpeechEnergyRef.current);
@@ -469,6 +530,8 @@ export function useGoogleSTT({
     }
     vadAboveSinceRef.current = 0;
     vadBelowSinceRef.current = 0;
+    sileroLeftoverRef.current = new Float32Array(0);
+    sileroChunkQueueRef.current = Promise.resolve();
 
     // Stop the parallel Web Speech assist instance, if running
     if (webSpeechModeRef.current === "assist") {
@@ -556,7 +619,24 @@ export function useGoogleSTT({
       vadAboveSinceRef.current = 0;
       vadBelowSinceRef.current = 0;
       noiseFloorRef.current = RMS_SPEECH_THRESHOLD;
+      sileroLeftoverRef.current = new Float32Array(0);
+    sileroChunkQueueRef.current = Promise.resolve();
       clearStabilityTimer();
+
+      // Lazily load the Silero VAD model/wasm (only downloads once per page
+      // lifetime) and reset its recurrent state for this session. If it fails
+      // (unsupported browser, network issue fetching the ~13.5MB wasm/model),
+      // fall back to the RMS engine for the rest of the session rather than
+      // blocking mic start.
+      if (VAD_ENGINE === "silero" && !sileroFailedRef.current) {
+        try {
+          await getSileroVadClient().init();
+          getSileroVadClient().reset();
+        } catch (err) {
+          sileroFailedRef.current = true;
+          log.warn("Silero VAD failed to initialize — falling back to RMS-based VAD:", err);
+        }
+      }
 
       // Tell backend to start STT stream
       ws.send(JSON.stringify({
@@ -573,7 +653,7 @@ export function useGoogleSTT({
       });
 
       // Start audio capture - send chunks to backend via WebSocket (VAD-gated)
-      await audioCapture.current.start((audioData: Uint8Array, rms: number, couplingStrength: number) => {
+      await audioCapture.current.start(async (audioData: Uint8Array, rms: number, couplingStrength: number) => {
         try {
           onEchoCouplingRef.current?.(couplingStrength);
 
@@ -582,21 +662,34 @@ export function useGoogleSTT({
           }
 
           const now = Date.now();
-          // Adaptive threshold: RMS must clear the noise floor by a margin, with
-          // RMS_SPEECH_THRESHOLD as an absolute minimum (never trigger on near-silence
-          // even if the tracked floor has drifted close to zero in a very quiet room).
-          const adaptiveThreshold = Math.max(RMS_SPEECH_THRESHOLD, noiseFloorRef.current * VAD_ADAPTIVE_MULTIPLIER);
-          const isSpeech = rms >= adaptiveThreshold;
+          const useSilero = VAD_ENGINE === "silero" && !sileroFailedRef.current && getSileroVadClient().isReady();
+          let isSpeech: boolean;
+          if (useSilero) {
+            try {
+              const runChunk = () => processSileroChunk(audioData);
+              const chunkPromise = sileroChunkQueueRef.current.then(runChunk, runChunk);
+              sileroChunkQueueRef.current = chunkPromise.then(
+                () => undefined,
+                () => undefined
+              );
+              const speechProb = await chunkPromise;
+              isSpeech = speechProb >= VAD_SILERO_THRESHOLD;
+            } catch (err) {
+              sileroFailedRef.current = true;
+              log.warn("Silero VAD inference failed — falling back to RMS-based VAD for this session:", err);
+              isSpeech = computeRmsIsSpeech(rms);
+            }
+          } else {
+            isSpeech = computeRmsIsSpeech(rms);
+          }
+
           if (isSpeech) {
             lastSpeechChunkMs.current = now;
             hadSpeechEnergyRef.current = true;
-          } else {
-            // Only track the floor during confirmed non-speech, post-echo-cancellation RMS.
-            noiseFloorRef.current = noiseFloorRef.current * (1 - VAD_NOISE_FLOOR_ALPHA) + rms * VAD_NOISE_FLOOR_ALPHA;
           }
 
           // Fast VAD signal (duration-guarded): confirms/releases on sustained
-          // RMS above/below threshold, independent of the STT round-trip.
+          // speech detection, independent of the STT round-trip.
           if (isSpeech) {
             vadBelowSinceRef.current = 0;
             if (vadAboveSinceRef.current === 0) vadAboveSinceRef.current = now;
@@ -674,7 +767,7 @@ export function useGoogleSTT({
       // Cleanup on error
       stopListeningInternal();
     }
-  }, [config, wsRef, stopListeningInternal, resetInactivityTimer, clearStabilityTimer]);
+  }, [config, wsRef, stopListeningInternal, resetInactivityTimer, clearStabilityTimer, computeRmsIsSpeech, processSileroChunk]);
 
   return {
     isListening: useWebSpeech ? webSpeech.isListening : isListening,

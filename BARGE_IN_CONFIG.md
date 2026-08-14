@@ -379,6 +379,24 @@ Việc giảm `NINEROUTER_STT_INTERVAL_MS` (trade-off tăng API calls/cost) vẫ
 
 Quan trọng: RMS đưa vào adaptive threshold này là RMS **sau khi đã qua NLMS echo cancellation** (§A.v2) — nên echo còn sót lại (nếu AEC chưa cancel hết) cũng bị "hấp thụ" vào noise floor thay vì liên tục trigger VAD sai.
 
+##### C.v3 — Silero VAD (neural, tiny model) thay cho RMS thuần (2026-08-14)
+
+**Vấn đề còn lại của v1/v2:** Testing thực tế (kể cả sau khi đã lọc bỏ các lớp dư thừa, chỉ giữ lại VAD-AEC thuần túy, và thử điều chỉnh `RMS_SPEECH_THRESHOLD`/`VAD_ADAPTIVE_MULTIPLIER`/`VAD_NOISE_FLOOR_ALPHA`) cho thấy VAD dựa hoàn toàn trên năng lượng (RMS) **không đủ tin cậy**: dễ phát sinh **từ ảo** (noise/tiếng thở/tiếng động vượt ngưỡng → chunk bị coi là "speech" → gửi lên Whisper → hallucination), và ngược lại **bỏ sót hoặc cắt mất một phần giọng nói nhỏ/nhẹ** khi ngưỡng (kể cả ngưỡng thích ứng) không khớp môi trường. Đây đúng là giới hạn cố hữu của energy-based VAD đã nêu ở §9.1 — không phải lỗi tham số.
+
+**Đã làm:** Thay bộ phát hiện bằng **Silero VAD v5** — mạng neural nhỏ (~2.3MB ONNX, được §9.1 gọi là "tiny model") chuyên phân biệt giọng nói người thật với noise/silence, đánh đổi lấy chi phí CPU/tải asset cao hơn (chấp nhận theo yêu cầu — độ chính xác quan trọng hơn):
+
+- `frontend/public/silero-vad.worker.js`: Worker riêng chạy `onnxruntime-web` (wasm, single-thread — tránh yêu cầu `SharedArrayBuffer`/COOP-COEP) để suy luận không chặn UI thread. Model + wasm runtime vendor tĩnh trong `public/models/` và `public/ort/` (không qua CDN), load lười (chỉ tải khi bắt đầu nghe lần đầu, cache theo vòng đời trang).
+- `frontend/src/utils/sileroVadClient.ts`: singleton main-thread, hàng đợi FIFO cho `processFrame()` (bắt buộc vì model có state hồi quy giữa các frame — chạy song song/không đúng thứ tự sẽ làm hỏng dự đoán), `reset()` state đầu mỗi phiên nghe.
+- `frontend/src/hooks/useGoogleSTT.ts`: mỗi chunk audio ~100ms (1600 mẫu @16kHz) được decode PCM16→Float32, cắt thành các frame đúng 512 mẫu (32ms — kích thước cố định của graph Silero v5), lấy max xác suất "speech" qua các frame trong chunk, so với `NEXT_PUBLIC_VAD_SILERO_THRESHOLD` (mặc định 0.5) để ra `isSpeech` — **thay** cho `rms >= adaptiveThreshold` cũ, nhưng **giữ nguyên** toàn bộ logic bao quanh (duration-guard `VAD_CONFIRM_MS`/`VAD_RELEASE_MS`, hangover trước khi ngừng gửi audio, `hadSpeechEnergyRef` cho hallucination-guard) — chỉ thay "cảm biến", không đổi kiến trúc pipeline.
+- **Tự động fallback về RMS**: nếu model/wasm load lỗi (mạng chậm khi tải ~13.5MB wasm + 2.3MB model lần đầu, hoặc browser không hỗ trợ) hoặc một lần inference lỗi giữa phiên, `sileroFailedRef` chuyển `true` và toàn bộ session còn lại quay về engine RMS cũ (§7.1.C/C.v2) — không làm hỏng hoàn toàn tính năng nghe.
+- Cấu hình qua `NEXT_PUBLIC_VAD_ENGINE` (`silero` mặc định, set `rms` để quay lại engine cũ hoàn toàn) + `NEXT_PUBLIC_VAD_SILERO_THRESHOLD`.
+
+**Hạn chế đã biết:**
+- Tốn thêm ~15.5MB tải lần đầu (13.5MB wasm runtime + 2.3MB model) — có cache dài hạn (`immutable`, xem `next.config.ts`) nhưng vẫn là chi phí thật trên mạng chậm/lần đầu vào app.
+- Tốn CPU hơn RMS thuần (chấp nhận theo yêu cầu) — chưa benchmark trên thiết bị di động yếu; nếu quá nặng, set `NEXT_PUBLIC_VAD_ENGINE=rms` để tắt.
+- Chưa test thực tế với mic+loa thật (chỉ verify được kiến trúc/contract qua đọc source `@ricky0123/vad-web`, chưa chạy trong browser thật ở môi trường này) — cần người dùng test lại kịch bản ở §8 sau khi đổi engine.
+- `NEXT_PUBLIC_VAD_SILERO_THRESHOLD=0.5` là giá trị khởi điểm hợp lý, chưa tinh chỉnh riêng theo dữ liệu thực tế của app này — có thể cần hạ xuống (nhạy hơn, đỡ bỏ sót) hoặc tăng lên (chặt hơn, đỡ từ ảo) tùy kết quả test.
+
 #### C2. Rename hook + làm rõ STT mode trong UI
 
 **Vấn đề:** `useGoogleSTT` gây hiểu nhầm; user/dev không biết đang ở path nào.

@@ -36,6 +36,21 @@ export function convertFloat32ToPCM16(float32Array: Float32Array): Int16Array {
 }
 
 /**
+ * Convert little-endian PCM16 bytes (as produced by audio-processor.worklet.js)
+ * back to Float32 samples in [-1, 1]. Used to feed the Silero VAD model, which
+ * expects float samples — the 16-bit quantization is inaudible and has no
+ * measurable effect on VAD accuracy.
+ */
+export function pcm16BytesToFloat32(data: Uint8Array): Float32Array {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const out = new Float32Array(data.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = view.getInt16(i * 2, true) / 32768;
+  }
+  return out;
+}
+
+/**
  * Resample audio from source sample rate to target sample rate
  * Simple linear interpolation resampling
  */
