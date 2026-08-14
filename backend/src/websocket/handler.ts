@@ -63,6 +63,7 @@ type LegacyAssistantMessage = {
   text: string;
   emotion: EmotionType;
   messageId?: string;
+  responseId?: string;
   domain?: DomainType;
   archiveItem?: ArchiveItemInfo;
   searchResults?: SearchResults;
@@ -433,7 +434,8 @@ function sendAssistantMessage(
   domain?: DomainType,
   archiveItem?: ArchiveItemInfo,
   searchResults?: SearchResults,
-  sentenceSync?: boolean
+  sentenceSync?: boolean,
+  responseId?: string
 ): void {
   // Legacy format (for existing frontend)
   const legacyMessage: LegacyAssistantMessage = {
@@ -441,6 +443,7 @@ function sendAssistantMessage(
     text,
     emotion,
     ...(messageId ? { messageId } : {}),
+    ...(responseId ? { responseId } : {}),
     ...(domain ? { domain } : {}),
     ...(archiveItem ? { archiveItem } : {}),
     ...(searchResults ? { searchResults } : {}),
@@ -1180,7 +1183,7 @@ async function processUserInput(session: Session, userText: string): Promise<voi
     const hasSentenceSync = ENABLE_PARALLEL_TTS && ttsQueue.length > 0 && 
                             response.text.length >= SHORT_RESPONSE_THRESHOLD;
     workflow.startStep("STEP7_TEXT_RESPONSE");
-    sendAssistantMessage(ws, response.text, response.emotion, assistantMessageId, domain, foundArchiveItem, allSearchResults, hasSentenceSync);
+    sendAssistantMessage(ws, response.text, response.emotion, assistantMessageId, domain, foundArchiveItem, allSearchResults, hasSentenceSync, responseId);
     session.status = "speaking";
     sendStatus(ws, "speaking", response.emotion, "Speaking...");
     workflow.endStep({ textLength: response.text.length, emotion: response.emotion, sentenceSync: hasSentenceSync });
@@ -1840,6 +1843,16 @@ async function handleMessage(session: Session, data: string): Promise<void> {
           session.sttSession.stop();
           session.sttSession = null;
           session.log.info("🛑 9Router STT session stopped");
+        }
+        break;
+      }
+
+      case "stt_finalize": {
+        // Frontend just promoted an interim transcript to final (one utterance done).
+        // Clear the rolling audio buffer so the next utterance's window doesn't still
+        // contain this one's audio — mic stays on, so the session itself isn't restarted.
+        if (session.sttSession) {
+          session.sttSession.finalizeUtterance();
         }
         break;
       }

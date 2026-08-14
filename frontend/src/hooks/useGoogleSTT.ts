@@ -394,7 +394,20 @@ export function useGoogleSTT({
     lastSpeechChunkMs.current = 0;
 
     emitTranscript(text, true);
-  }, [interimStabilityMs, clearStabilityTimer, emitTranscript]);
+
+    // Tell the backend this utterance is done so it clears its rolling audio buffer.
+    // The mic stays on for the whole conversation (no per-utterance session restart),
+    // so without this signal the backend keeps re-transcribing prior utterances' audio
+    // alongside the next one, and the next final transcript comes back merged with this one.
+    try {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "stt_finalize" }));
+      }
+    } catch (err) {
+      log.error("Error sending stt_finalize:", err);
+    }
+  }, [interimStabilityMs, clearStabilityTimer, emitTranscript, wsRef]);
 
   // ─── WebSocket message listener for STT responses ───
   useEffect(() => {

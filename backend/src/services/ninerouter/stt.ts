@@ -114,6 +114,21 @@ export class NineRouterSTTSession {
     this.stopInternal(true);
   }
 
+  /**
+   * Clear the rolling audio buffer at an utterance boundary the frontend has already
+   * confirmed (it just promoted an interim transcript to final), without tearing down
+   * the session. The session otherwise never scopes its buffer to one utterance — it
+   * keeps accumulating audio for as long as the mic stays on — so without this, the
+   * next utterance's transcription window still contains prior utterances' audio and
+   * Whisper returns them concatenated together.
+   */
+  finalizeUtterance(): void {
+    this.audioChunks = [];
+    this.totalBytes = 0;
+    this.lastTranscript = "";
+    this.silentTranscribeCount = 0;
+  }
+
   getIsActive(): boolean {
     return this.isActive;
   }

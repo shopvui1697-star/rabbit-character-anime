@@ -90,8 +90,12 @@ export default function Home() {
     });
   }, []);
 
-  // Track the current sentence-sync message ID (set when sentenceSync assistant_message arrives)
-  const sentenceSyncMessageIdRef = useRef<string | null>(null);
+  // Map of in-flight turns: backend responseId -> frontend message bubble ID.
+  // Audio chunks carry the responseId they belong to, so this lets onSentencePlay route
+  // each sentence to the correct bubble even if turns overlap (barge-in, mic always-on).
+  // A single global "current" ref isn't safe here: it can still point at an older turn
+  // while that turn's trailing chunks are draining, causing new-turn text to merge in.
+  const responseIdToMessageIdRef = useRef<Map<string, string>>(new Map());
   // Ref-based bridge to call appendToMessage from useAudioPlayer callback
   const appendToMessageRef = useRef<((messageId: string, sentence: string) => void) | null>(null);
   // Track if early barge-in was triggered (reset on final transcript)
@@ -106,13 +110,16 @@ export default function Home() {
         registerTtsContent(lastAssistantTextRef.current);
       }
     },
-    onSentencePlay: (sentence, index) => {
+    onSentencePlay: (sentence, index, responseId) => {
       registerTtsContent(sentence);
-      // When audio chunk N starts playing, display its sentence text
-      const messageId = sentenceSyncMessageIdRef.current;
+      // When audio chunk N starts playing, display its sentence text — routed by the
+      // chunk's own responseId so a lingering previous turn can't write into it.
+      const messageId = responseId ? responseIdToMessageIdRef.current.get(responseId) : undefined;
       if (messageId && appendToMessageRef.current) {
         log.debug(`Sentence sync: displaying sentence #${index} for message ${messageId.slice(-8)}`);
         appendToMessageRef.current(messageId, sentence);
+      } else {
+        log.warn(`Sentence sync: no message mapped for responseId ${responseId?.slice(-8) || "none"}, dropping sentence #${index}`);
       }
     },
   });
@@ -227,10 +234,18 @@ export default function Home() {
       waitingPhrase.cancelWaitingTimer();
     },
     onItemFocused: handleItemFocused,
-    onSentenceSync: (messageId) => {
+    onSentenceSync: (messageId, responseId) => {
       // Sentence-sync mode: text will be revealed sentence-by-sentence with audio
-      log.debug(`Sentence sync mode for message: ${messageId.slice(-8)}`);
-      sentenceSyncMessageIdRef.current = messageId;
+      log.debug(`Sentence sync mode for message: ${messageId.slice(-8)} (responseId: ${responseId?.slice(-8) || "none"})`);
+      if (responseId) {
+        responseIdToMessageIdRef.current.set(responseId, messageId);
+        // Bound the map: drop the oldest entry once it grows past a small cap so a
+        // long-running session doesn't accumulate one entry per turn forever.
+        if (responseIdToMessageIdRef.current.size > 10) {
+          const oldestKey = responseIdToMessageIdRef.current.keys().next().value;
+          if (oldestKey) responseIdToMessageIdRef.current.delete(oldestKey);
+        }
+      }
     },
   });
 
@@ -420,9 +435,6 @@ export default function Home() {
     audioPlayer.cancelAllAudio();
     clearTtsContent();
     restoreSharedVolume();
-
-    // Reset sentence sync state for new response
-    sentenceSyncMessageIdRef.current = null;
 
     // Clear any pending audio waiting for short-waiting to finish
     pendingAudioQueueRef.current = [];

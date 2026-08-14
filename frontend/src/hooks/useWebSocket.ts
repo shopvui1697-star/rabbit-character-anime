@@ -71,7 +71,7 @@ interface UseWebSocketOptions {
   onTranscript?: (text: string, isFinal: boolean) => void;  // Real-time transcription
   onBackendResponse?: () => void;  // Called when any backend response arrives (text or audio)
   onItemFocused?: (index: number, itemId: string, domain: DomainType, itemTitle: string) => void;  // Item selected via voice
-  onSentenceSync?: (messageId: string) => void;  // Called when sentenceSync message arrives (text will come with audio)
+  onSentenceSync?: (messageId: string, responseId?: string) => void;  // Called when sentenceSync message arrives (text will come with audio)
 }
 
 interface UseWebSocketReturn {
@@ -222,7 +222,7 @@ export function useWebSocket({
           
           // Notify parent about sentence sync mode
           if (sentenceSync && messageId) {
-            onSentenceSync?.(messageId);
+            onSentenceSync?.(messageId, message.responseId as string | undefined);
           }
           
           if (messageId) {
@@ -663,7 +663,7 @@ export function useWebSocket({
           log.debug("Unknown message type:", message.type);
       }
     },
-    [generateId, onAudio, onAudioChunk, onWaiting, onTranscript, onBackendResponse, onItemFocused]
+    [generateId, onAudio, onAudioChunk, onWaiting, onTranscript, onBackendResponse, onItemFocused, onSentenceSync]
   );
 
   // Send message to server

@@ -21,7 +21,7 @@ interface AudioChunk {
 
 interface UseAudioPlayerOptions {
   /** Called when a chunk starts playing, with its sentence text (for sentence sync display) */
-  onSentencePlay?: (sentence: string, index: number) => void;
+  onSentencePlay?: (sentence: string, index: number, responseId?: string) => void;
   /** Called when TTS playback begins (each chunk/full audio) — for echo guard cooldown */
   onPlaybackStart?: () => void;
 }
@@ -262,9 +262,12 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     onPlaybackStartRef.current?.();
 
     // Notify parent: sentence text should be displayed NOW (sync with audio start)
+    // Pass the responseId this chunk queue is currently locked to, so the caller can
+    // verify the sentence still belongs to the turn it thinks it does (turns can overlap
+    // when a new response starts while the previous one's chunks are still draining).
     const sentenceText = sentenceQueueRef.current.get(nextIndex);
     if (sentenceText && onSentencePlayRef.current) {
-      onSentencePlayRef.current(sentenceText, nextIndex);
+      onSentencePlayRef.current(sentenceText, nextIndex, acceptedResponseIdRef.current || undefined);
     }
 
     try {
