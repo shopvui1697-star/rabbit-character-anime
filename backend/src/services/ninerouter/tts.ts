@@ -22,17 +22,22 @@ export async function synthesizeSpeech(
   options: TTSOptions = {}
 ): Promise<Buffer> {
   const { voice = "female" } = options;
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error("TTS skipped: empty input text");
+  }
+
   const { baseUrl } = getNineRouterConfig();
   const model = VOICES[voice]();
   const startTime = performance.now();
-  const textPreview = text.length > 30 ? text.slice(0, 30) + "..." : text;
+  const textPreview = trimmed.length > 30 ? trimmed.slice(0, 30) + "..." : trimmed;
 
-  log.debug(`TTS request START: "${textPreview}" (${text.length} chars, model: ${model})`);
+  log.debug(`TTS request START: "${textPreview}" (${trimmed.length} chars, model: ${model})`);
 
   const response = await fetch(`${baseUrl}/v1/audio/speech`, {
     method: "POST",
     headers: nineRouterHeaders(),
-    body: JSON.stringify({ model, input: text }),
+    body: JSON.stringify({ model, input: trimmed }),
   });
 
   if (!response.ok) {
@@ -46,9 +51,9 @@ export async function synthesizeSpeech(
   const audioKB = Math.round(audioBuffer.length / 1024);
 
   if (durationMs > 500) {
-    log.warn(`TTS request SLOW: ${durationMs}ms for "${textPreview}" (${text.length} chars → ${audioKB}KB)`);
+    log.warn(`TTS request SLOW: ${durationMs}ms for "${textPreview}" (${trimmed.length} chars → ${audioKB}KB)`);
   } else {
-    log.debug(`TTS request END: ${durationMs}ms for "${textPreview}" (${text.length} chars → ${audioKB}KB)`);
+    log.debug(`TTS request END: ${durationMs}ms for "${textPreview}" (${trimmed.length} chars → ${audioKB}KB)`);
   }
 
   return audioBuffer;

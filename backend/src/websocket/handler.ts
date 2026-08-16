@@ -1267,6 +1267,11 @@ async function processUserInput(session: Session, userText: string): Promise<voi
       if (session.currentResponseId !== responseId) {
         log.debug(`[${session.id.slice(0, 8)}] Skipping sequential TTS (cancelled)`);
         workflow.endStep({ mode: "cancelled" });
+      } else if (!response.text.trim()) {
+        // Empty LLM reply — skip TTS to avoid 9Router "Missing required field: input"
+        log.debug(`[${session.id.slice(0, 8)}] Skipping sequential TTS (empty text)`);
+        sessionLog.info("TTS skipped: empty assistant response");
+        workflow.endStep({ mode: "skipped", reason: "empty_text" });
       } else {
         log.debug(`[${session.id.slice(0, 8)}] Sequential TTS (fallback)`);
         const seqStartTime = performance.now();
