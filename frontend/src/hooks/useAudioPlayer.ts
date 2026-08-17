@@ -17,7 +17,13 @@ interface AudioChunk {
   isLast: boolean;
   responseId?: string;
   sentence?: string;  // Sentence text for synchronized text+audio display
+  failed?: boolean;   // TTS synthesis failed for this chunk (even after retry) — no audio data
 }
+
+// If a chunk hasn't arrived (or was marked failed) within this window, skip it
+// rather than stalling playback forever — covers both backend synthesis
+// failures and messages lost in transit.
+const CHUNK_STALL_TIMEOUT_MS = 3000;
 
 interface UseAudioPlayerOptions {
   /** Called when a chunk starts playing, with its sentence text (for sentence sync display) */
@@ -52,6 +58,18 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
   const totalChunksRef = useRef(0);
   const isPlayingQueueRef = useRef(false);
   const isProcessingChunkRef = useRef(false);
+
+  // Indices the backend explicitly reported as failed (no audio ever coming)
+  const failedChunksRef = useRef<Set<number>>(new Set());
+  // Safety-net timer: fires if we've been waiting on the same chunk index too long
+  const stallTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearStallTimeout = useCallback(() => {
+    if (stallTimeoutRef.current) {
+      clearTimeout(stallTimeoutRef.current);
+      stallTimeoutRef.current = null;
+    }
+  }, []);
 
   // Simple response tracking: only accept audio matching this responseId
   // null = accept any, "__CANCELLED__" = reject all
@@ -94,18 +112,20 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     sentenceQueueRef.current.clear();
     currentChunkIndexRef.current = 0;
     totalChunksRef.current = 0;
+    failedChunksRef.current.clear();
+    clearStallTimeout();
 
     // Clear protected audio state
     isProtectedAudioRef.current = false;
     protectedAudioQueueRef.current = [];
-    
+
     // Clear pending chunks buffer
     pendingChunksRef.current.clear();
 
     // Reject all audio until new response with valid responseId
     acceptedResponseIdRef.current = "__CANCELLED__";
     setIsPlaying(false);
-  }, [stopSource]);
+  }, [stopSource, clearStallTimeout]);
 
   // Play full audio (for greeting, long_waiting, sequential TTS)
   const play = useCallback(
@@ -241,15 +261,54 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
         currentChunkIndexRef.current = 0;
         totalChunksRef.current = 0;
         chunkArrivalTimesRef.current.clear();
+        failedChunksRef.current.clear();
+        clearStallTimeout();
         setIsPlaying(false);
-      } else {
-        // Waiting for chunk - log gap
-        const waitingSince = lastChunkEndRef.current > 0 ? Math.round(now - lastChunkEndRef.current) : 0;
-        log.warn(`⏳ Waiting for chunk ${nextIndex}/${totalChunksRef.current} (gap: ${waitingSince}ms)`);
+        isProcessingChunkRef.current = false;
+        return;
+      }
+
+      if (failedChunksRef.current.has(nextIndex)) {
+        // Backend told us this chunk will never have audio (or the stall
+        // timeout gave up on it) — skip straight to the next one instead of
+        // waiting forever.
+        log.warn(`⏭️ Skipping failed chunk ${nextIndex}/${totalChunksRef.current}`);
+        clearStallTimeout();
+        lastChunkEndRef.current = now;
+        isProcessingChunkRef.current = false;
+        currentChunkIndexRef.current++;
+        processNextChunk();
+        return;
+      }
+
+      // Waiting for chunk - log gap and arm a stall safety-net in case the
+      // message never arrives at all (lost over the wire, not just a
+      // reported synthesis failure).
+      const waitingSince = lastChunkEndRef.current > 0 ? Math.round(now - lastChunkEndRef.current) : 0;
+      log.warn(`⏳ Waiting for chunk ${nextIndex}/${totalChunksRef.current} (gap: ${waitingSince}ms)`);
+      if (!stallTimeoutRef.current) {
+        const waitingIndex = nextIndex;
+        stallTimeoutRef.current = setTimeout(() => {
+          stallTimeoutRef.current = null;
+          // Only act if we're still stuck waiting on this same index
+          if (
+            isPlayingQueueRef.current &&
+            currentChunkIndexRef.current === waitingIndex &&
+            !audioQueueRef.current.has(waitingIndex)
+          ) {
+            log.warn(`⏭️ Chunk ${waitingIndex} never arrived after ${CHUNK_STALL_TIMEOUT_MS}ms — skipping`);
+            failedChunksRef.current.add(waitingIndex);
+            isProcessingChunkRef.current = false;
+            processNextChunk();
+          }
+        }, CHUNK_STALL_TIMEOUT_MS);
       }
       isProcessingChunkRef.current = false;
       return;
     }
+
+    // Got real audio data for this chunk — cancel any pending stall timer
+    clearStallTimeout();
 
     // Calculate gap between chunks
     const gap = lastChunkEndRef.current > 0 ? Math.round(now - lastChunkEndRef.current) : 0;
@@ -290,13 +349,26 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       currentChunkIndexRef.current++;
       processNextChunk();
     }
-  }, []);
+  }, [clearStallTimeout]);
 
   // Track chunk arrival times for timing analysis
   const chunkArrivalTimesRef = useRef<Map<number, number>>(new Map());
   const firstChunkTimeRef = useRef<number>(0);
 
   // Play audio chunk (for parallel TTS streaming)
+  // Store an arrived chunk in the right place: real audio in audioQueueRef,
+  // or the index in failedChunksRef when the backend reported it as failed.
+  const recordChunk = useCallback((c: AudioChunk) => {
+    if (c.failed) {
+      failedChunksRef.current.add(c.index);
+      audioQueueRef.current.delete(c.index);
+    } else {
+      audioQueueRef.current.set(c.index, c.data);
+      failedChunksRef.current.delete(c.index);
+    }
+    if (c.sentence) sentenceQueueRef.current.set(c.index, c.sentence);
+  }, []);
+
   const playChunk = useCallback((chunk: AudioChunk) => {
     const now = performance.now();
     
@@ -339,8 +411,7 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     // If protected audio is playing, buffer chunks but don't start playback yet
     if (isProtectedAudioRef.current) {
       log.debug(`Protected audio playing - buffering chunk ${chunk.index}/${chunk.total}`);
-      audioQueueRef.current.set(chunk.index, chunk.data);
-      if (chunk.sentence) sentenceQueueRef.current.set(chunk.index, chunk.sentence);
+      recordChunk(chunk);
       totalChunksRef.current = chunk.total;
 
       // If this is chunk 0, mark that we have a pending chunked response
@@ -364,24 +435,24 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       // Clear and setup new queue
       audioQueueRef.current.clear();
       sentenceQueueRef.current.clear();
-      audioQueueRef.current.set(0, chunk.data);
-      if (chunk.sentence) sentenceQueueRef.current.set(0, chunk.sentence);
+      failedChunksRef.current.clear();
+      clearStallTimeout();
+      recordChunk(chunk);
       totalChunksRef.current = chunk.total;
-      
+
       // Check for any chunks that arrived before chunk 0 and add them to queue
       if (chunk.responseId) {
         const pendingForThis = pendingChunksRef.current.get(chunk.responseId);
         if (pendingForThis && pendingForThis.length > 0) {
           log.debug(`Processing ${pendingForThis.length} buffered chunks for response ${chunk.responseId.slice(-8)}`);
           for (const pendingChunk of pendingForThis) {
-            audioQueueRef.current.set(pendingChunk.index, pendingChunk.data);
-            if (pendingChunk.sentence) sentenceQueueRef.current.set(pendingChunk.index, pendingChunk.sentence);
+            recordChunk(pendingChunk);
             log.debug(`Added buffered chunk ${pendingChunk.index} to queue`);
           }
           pendingChunksRef.current.delete(chunk.responseId);
         }
       }
-      
+
       isPlayingQueueRef.current = true;
       isProcessingChunkRef.current = false;
       currentChunkIndexRef.current = 0;
@@ -396,15 +467,17 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
       return;
     }
 
-    audioQueueRef.current.set(chunk.index, chunk.data);
-    if (chunk.sentence) sentenceQueueRef.current.set(chunk.index, chunk.sentence);
+    recordChunk(chunk);
     totalChunksRef.current = chunk.total;
 
-    // If we're waiting for this chunk, process it
-    if (!isProcessingChunkRef.current && audioQueueRef.current.has(currentChunkIndexRef.current)) {
+    // If we're waiting for this chunk (or it just arrived marked failed), process it
+    if (
+      !isProcessingChunkRef.current &&
+      (audioQueueRef.current.has(currentChunkIndexRef.current) || failedChunksRef.current.has(currentChunkIndexRef.current))
+    ) {
       processNextChunk();
     }
-  }, [processNextChunk, stopSource]);
+  }, [processNextChunk, stopSource, recordChunk, clearStallTimeout]);
 
   // Stop audio playback
   const stop = useCallback(() => {
@@ -417,8 +490,10 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     sentenceQueueRef.current.clear();
     currentChunkIndexRef.current = 0;
     totalChunksRef.current = 0;
+    failedChunksRef.current.clear();
+    clearStallTimeout();
     setIsPlaying(false);
-  }, [stopSource]);
+  }, [stopSource, clearStallTimeout]);
 
   // Set volume via shared GainNode
   const setVolume = useCallback((volume: number) => {
@@ -435,8 +510,9 @@ export function useAudioPlayer(options?: UseAudioPlayerOptions): UseAudioPlayerR
     return () => {
       stopSource(sourceRef.current);
       sourceRef.current = null;
+      clearStallTimeout();
     };
-  }, [stopSource]);
+  }, [stopSource, clearStallTimeout]);
 
   return {
     isPlaying,

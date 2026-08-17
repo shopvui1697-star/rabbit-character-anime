@@ -239,7 +239,7 @@ async function withTTSLimit<T>(fn: () => Promise<T>): Promise<T> {
   if (activeTTSCount >= MAX_CONCURRENT_TTS) {
     await new Promise<void>(resolve => ttsWaitQueue.push(resolve));
   }
-  
+
   activeTTSCount++;
   try {
     return await fn();
@@ -248,6 +248,27 @@ async function withTTSLimit<T>(fn: () => Promise<T>): Promise<T> {
     // Wake up next waiting request
     const next = ttsWaitQueue.shift();
     if (next) next();
+  }
+}
+
+// Retry a TTS synthesis once after a transient failure before giving up.
+// A single flaky 9Router call would otherwise permanently drop that sentence's
+// audio chunk, stalling the frontend's chunk queue forever (it waits on chunk
+// index N which never arrives).
+const TTS_RETRY_DELAY_MS = 250;
+
+async function synthesizeWithRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (firstError) {
+    log.debug("TTS attempt failed, retrying once:", firstError);
+    await new Promise(resolve => setTimeout(resolve, TTS_RETRY_DELAY_MS));
+    try {
+      return await fn();
+    } catch (retryError) {
+      log.error("TTS retry also failed:", retryError);
+      throw retryError;
+    }
   }
 }
 
@@ -1009,12 +1030,16 @@ async function processUserInput(session: Session, userText: string): Promise<voi
           log.debug(`[${session.id.slice(0, 8)}] TTS #${idx} START: "${sentence.slice(0, 30)}..." (${charCount} chars)`);
           sessionLog.debug(`TTS chunk #${idx} BEGIN: ${charCount} chars, emotion: ${emotion}, text: "${sentence.slice(0, 50)}..."`);
 
-          // Use TTS concurrency limiter to avoid rate limiting
+          // Use TTS concurrency limiter to avoid rate limiting, and retry once
+          // on transient failure so a single flaky call doesn't permanently
+          // drop this chunk (which would stall the frontend's ordered queue).
           const ttsPromise = withTTSLimit(() =>
-            synthesizeSpeechBase64(sentence, {
-              emotion,
-              voice: "female",
-            })
+            synthesizeWithRetry(() =>
+              synthesizeSpeechBase64(sentence, {
+                emotion,
+                voice: "female",
+              })
+            )
           ).then(audio => {
             const durationMs = Math.round(performance.now() - startTime);
             const audioKB = Math.round(audio.length * 0.75 / 1024);
@@ -1211,13 +1236,14 @@ async function processUserInput(session: Session, userText: string): Promise<voi
       // Process all chunks in parallel and send each as it completes
       const sendPromises = ttsQueue.map(async (promise, i) => {
         const result = await promise;
+
+        // Check if this response is still current (not cancelled by barge-in)
+        if (session.currentResponseId !== responseId) {
+          log.debug(`[${session.id.slice(0, 8)}] Skipping chunk #${i} (cancelled)`);
+          return null;
+        }
+
         if (result) {
-          // Check if this response is still current (not cancelled by barge-in)
-          if (session.currentResponseId !== responseId) {
-            log.debug(`[${session.id.slice(0, 8)}] Skipping chunk #${result.index} (cancelled)`);
-            return null;
-          }
-          
           // Send immediately when this chunk is ready (don't wait for earlier chunks)
           // Include sentence text for synchronized text+audio display
           send(ws, {
@@ -1234,6 +1260,22 @@ async function processUserInput(session: Session, userText: string): Promise<voi
           chunkResults.push(result);
           return result;
         }
+
+        // Synthesis failed even after retry. Still send a message for this index
+        // (with no audio) so the frontend's ordered chunk queue doesn't wait
+        // forever on an index that will never arrive — it can skip straight
+        // to the next chunk instead of stalling playback.
+        log.debug(`[${session.id.slice(0, 8)}] Sending failed marker for chunk #${i}`);
+        send(ws, {
+          type: "audio_chunk",
+          data: "",
+          format: "mp3",
+          index: i,
+          total: totalChunks,
+          isLast: i === totalChunks - 1,
+          responseId,
+          failed: true,
+        });
         return null;
       });
       

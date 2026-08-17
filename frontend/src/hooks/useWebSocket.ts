@@ -61,6 +61,7 @@ interface AudioChunk {
   isLast: boolean;
   responseId?: string;  // Used to identify which response this chunk belongs to
   sentence?: string;    // Sentence text for synchronized text+audio display
+  failed?: boolean;     // TTS synthesis failed for this chunk (even after retry) — no audio data
 }
 
 interface UseWebSocketOptions {
@@ -350,6 +351,7 @@ export function useWebSocket({
             isLast: message.isLast as boolean,
             responseId: message.responseId as string | undefined,
             sentence: message.sentence as string | undefined,
+            failed: message.failed as boolean | undefined,
           });
           break;
 
